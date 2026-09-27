@@ -6,8 +6,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import com.example.videodownload.ui.HomeScreen
 import com.example.videodownload.ui.MainViewModel
+import com.example.videodownload.ui.SplashScreen
 import com.example.videodownload.ui.theme.VideoDownloadTheme
 
 class MainActivity : ComponentActivity() {
@@ -23,7 +28,21 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             VideoDownloadTheme {
-                HomeScreen(viewModel = viewModel)
+                val showSplash = remember { mutableStateOf(true) }
+
+                Crossfade(
+                    targetState = showSplash.value,
+                    animationSpec = tween(durationMillis = 500),
+                    label = "SplashToHomeTransition"
+                ) { isSplash ->
+                    if (isSplash) {
+                        SplashScreen(
+                            onSplashFinished = { showSplash.value = false }
+                        )
+                    } else {
+                        HomeScreen(viewModel = viewModel)
+                    }
+                }
             }
         }
     }
