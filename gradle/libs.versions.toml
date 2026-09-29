@@ -39,4 +39,3 @@ newpipe-extractor = { group = "com.github.TeamNewPipe", name = "NewPipeExtractor
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
-

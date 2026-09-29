@@ -16,6 +16,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
@@ -46,6 +47,55 @@ class AndroidVideoDownloader(private val context: Context) {
             Platform.YOUTUBE -> "https://www.youtube.com/" to "https://www.youtube.com"
             else -> "https://x.com/" to "https://x.com"
         }
+    }
+
+    fun validateDownloadedVideo(file: File): Boolean {
+        if (!file.exists() || file.length() < 50_000) {
+            Log.w(TAG, "[validateDownloadedVideo] Archivo no existe o es demasiado pequeño: ${file.length()} bytes")
+            return false
+        }
+
+        try {
+            val header = ByteArray(16)
+            FileInputStream(file).use { input ->
+                val read = input.read(header)
+                if (read < 8) return false
+            }
+
+            val headerString = String(header, Charsets.US_ASCII).lowercase()
+
+            // Descartar respuestas de error HTML o JSON
+            if (headerString.startsWith("<!doc") || headerString.startsWith("<html") || headerString.startsWith("{")) {
+                Log.e(TAG, "[validateDownloadedVideo] RECHAZADO: El archivo descargado es una página HTML/JSON y no un video.")
+                return false
+            }
+
+            // Descartar imágenes JPEG (Magic bytes: 0xFF, 0xD8, 0xFF)
+            if (header[0] == 0xFF.toByte() && header[1] == 0xD8.toByte() && header[2] == 0xFF.toByte()) {
+                Log.e(TAG, "[validateDownloadedVideo] RECHAZADO: El archivo descargado es una imagen JPEG y no un video.")
+                return false
+            }
+
+            // Descartar imágenes PNG (Magic bytes: 0x89, 0x50, 0x4E, 0x47)
+            if (header[0] == 0x89.toByte() && header[1] == 0x50.toByte() && header[2] == 0x4E.toByte() && header[3] == 0x47.toByte()) {
+                Log.e(TAG, "[validateDownloadedVideo] RECHAZADO: El archivo descargado es una imagen PNG.")
+                return false
+            }
+
+            // Validar MP4 / M4A (ftyp / isom / mp42)
+            val isFtyp = header[4] == 0x66.toByte() && header[5] == 0x74.toByte() && header[6] == 0x79.toByte() && header[7] == 0x70.toByte()
+
+            // Validar WebM (0x1A, 0x45, 0xDF, 0xA3)
+            val isWebm = header[0] == 0x1A.toByte() && header[1] == 0x45.toByte() && header[2] == 0xDF.toByte() && header[3] == 0xA3.toByte()
+
+            if (isFtyp || isWebm || file.length() > 500_000) {
+                Log.i(TAG, "[validateDownloadedVideo] VÁLIDO: Archivo multimedia verificado (${file.length() / 1024} KB)")
+                return true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[validateDownloadedVideo] Error validando firma del archivo: ${e.message}")
+        }
+        return false
     }
 
     suspend fun downloadMediaAsync(
@@ -111,7 +161,7 @@ class AndroidVideoDownloader(private val context: Context) {
                 tempVideoFile.delete()
                 tempAudioFile.delete()
 
-                if (success) {
+                if (success && validateDownloadedVideo(finalFile)) {
                     onProgress?.invoke(100, "¡Guardando en Galería de Android!")
                     Log.i(TAG, "[downloadMediaAsync] DESCARGA Y MUXING EXITOSO: Archivo final ${finalFile.name} (${finalFile.length() / 1024} KB)")
 
@@ -127,8 +177,8 @@ class AndroidVideoDownloader(private val context: Context) {
                     return@withContext System.currentTimeMillis()
                 } else {
                     if (finalFile.exists()) finalFile.delete()
-                    Log.e(TAG, "[downloadMediaAsync] ERROR CRÍTICO: Muxer falló o archivo inválido. Descarga cancelada.")
-                    throw Exception("No se pudo unir el audio con el video en esta calidad (${option.label}). Prueba otra opción.")
+                    Log.e(TAG, "[downloadMediaAsync] ERROR CRÍTICO: Archivo final no superó la validación multimedia.")
+                    throw Exception("El video descargado es inválido o no contiene datos de video.")
                 }
             } catch (e: Exception) {
                 tempVideoFile.delete()
@@ -363,12 +413,16 @@ class AndroidVideoDownloader(private val context: Context) {
             )
             Log.d(TAG, "[downloadMedia] Ruta destino Audio (Music/VideoDownload/$fileName) | MIME=$mime")
         } else {
-            request.setMimeType("video/mp4")
+            val mime = when (ext) {
+                "webm" -> "video/webm"
+                else -> "video/mp4"
+            }
+            request.setMimeType(mime)
             request.setDestinationInExternalPublicDir(
                 Environment.DIRECTORY_MOVIES,
                 "VideoDownload/$fileName"
             )
-            Log.d(TAG, "[downloadMedia] Ruta destino Video (Movies/VideoDownload/$fileName)")
+            Log.d(TAG, "[downloadMedia] Ruta destino Video (Movies/VideoDownload/$fileName) | MIME=$mime")
         }
 
         val downloadId = downloadManager.enqueue(request)

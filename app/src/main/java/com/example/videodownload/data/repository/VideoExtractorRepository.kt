@@ -5,13 +5,16 @@ import android.util.Log
 import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
+import com.example.videodownload.utils.FacebookCookieManager
 import com.example.videodownload.utils.InstagramCookieManager
+import com.example.videodownload.utils.YouTubeCookieManager
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -29,6 +32,7 @@ import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.exceptions.ParsingException
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.net.URLDecoder
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
@@ -76,8 +80,8 @@ class VideoExtractorRepository(private val context: Context) {
             TikTokExtractor(client),
             TwitterExtractor(client, context),
             InstagramExtractor(context),
-            FacebookExtractor(client),
-            YouTubeExtractor(client)
+            FacebookExtractor(client, context),
+            YouTubeExtractor(client, context)
         )
     }
 
@@ -668,9 +672,12 @@ class TwitterExtractor(
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE YOUTUBE (NewPipeExtractor v0.26.5 con Muxer de Audio)
+// EXTRACTOR MODULAR DE YOUTUBE (1. NewPipeExtractor v0.26.5 + 2. Native yt-dlp Ajustado)
 // ============================================================================
-class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
+class NewPipeOkHttpDownloader(
+    private val client: OkHttpClient,
+    private val context: Context
+) : Downloader() {
 
     private val cookieMap = ConcurrentHashMap<String, String>()
 
@@ -682,8 +689,13 @@ class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
 
         val requestBuilder = Request.Builder()
             .url(url)
-            .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36")
-            .addHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
+            .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .addHeader("Accept-Language", "en-US,en;q=0.9,es-ES;q=0.8")
+
+        val googleCookieHeader = YouTubeCookieManager.getCookieHeader(context)
+        if (!googleCookieHeader.isNullOrBlank()) {
+            requestBuilder.addHeader("Cookie", googleCookieHeader)
+        }
 
         headers?.forEach { (key, values) ->
             values.forEach { value ->
@@ -730,16 +742,22 @@ class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
     }
 }
 
-class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
+class YouTubeExtractor(
+    private val client: OkHttpClient,
+    private val context: Context
+) : PlatformExtractor {
     override val platform = Platform.YOUTUBE
 
     companion object {
         const val NEWPIPE_VERSION = "v0.26.5"
+        private const val BACKOFF_CACHE_MS = 300_000L // 5 minutos de cache tras bot-check
+        private val blockedVideoIds = ConcurrentHashMap<String, Long>()
+        private const val USER_AGENT_MOBILE = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
     init {
         try {
-            NewPipe.init(NewPipeOkHttpDownloader(client))
+            NewPipe.init(NewPipeOkHttpDownloader(client, context))
             Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipe.init() inicializado | Versión: $NEWPIPE_VERSION")
         } catch (e: Exception) {
             Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipe.init notice: ${e.message}")
@@ -770,18 +788,35 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
         val canonicalYoutubeUrl = if (!videoId.isNullOrBlank()) "https://www.youtube.com/watch?v=$videoId" else url.split("?")[0]
 
         Log.d(VideoExtractorRepository.TAG, "==================================================")
-        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipeExtractor Versión En Uso: $NEWPIPE_VERSION")
-        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Raw URL: '$url'")
-        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Extracted Video ID: '$videoId'")
-        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Canonical YouTube URL: '$canonicalYoutubeUrl'")
+        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Raw URL: '$url' | Video ID: '$videoId'")
 
         if (videoId.isNullOrBlank()) {
             return@withContext Result.failure(Exception("No se pudo extraer el ID del video de YouTube."))
         }
 
-        // METODO 1: NewPipeExtractor v0.26.5
+        val hasCookies = YouTubeCookieManager.hasCookies(context)
+
+        // Comprobar Cache de Backoff tras bot-check
+        val lastBlockedTime = blockedVideoIds[videoId] ?: 0L
+        val now = System.currentTimeMillis()
+        if (now - lastBlockedTime < BACKOFF_CACHE_MS) {
+            val remainingMin = ((BACKOFF_CACHE_MS - (now - lastBlockedTime)) / 60000L) + 1
+            Log.w(VideoExtractorRepository.TAG, "[YouTubeExtractor] Video $videoId está en cache de bloqueo por $remainingMin min más.")
+            val msg = if (hasCookies) {
+                "La sesión expiró o fue rechazada. Vuelve a iniciar sesión en Google."
+            } else {
+                "YouTube pide verificación. Inicia sesión con Google (cuenta secundaria) o cambia de red."
+            }
+            return@withContext Result.failure(Exception(msg))
+        }
+
+        var isBotCheckError = false
+
+        // --------------------------------------------------------------------
+        // MÉTODOS 1: NewPipeExtractor v0.26.5
+        // --------------------------------------------------------------------
         try {
-            Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Ejecutando NewPipeExtractor $NEWPIPE_VERSION para '$canonicalYoutubeUrl'...")
+            Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] MÉTODOS 1 -> Ejecutando NewPipeExtractor $NEWPIPE_VERSION para '$canonicalYoutubeUrl'...")
             val streamInfo = StreamInfo.getInfo(ServiceList.YouTube, canonicalYoutubeUrl)
 
             if (streamInfo != null) {
@@ -790,12 +825,9 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
                 val thumb = streamInfo.thumbnails.firstOrNull()?.url ?: ""
 
                 val optionsList = mutableListOf<DownloadOption>()
-
-                // Obtener la mejor pista de audio M4A/AAC para unificar con videos DASH
                 val audioStreams = streamInfo.audioStreams
                 val bestAudioUrl = audioStreams?.firstOrNull()?.content
 
-                // 1. Streams de video combinados (Progressive MP4 - Video + Audio integrados)
                 val videoStreams = streamInfo.videoStreams
                 if (videoStreams != null && videoStreams.isNotEmpty()) {
                     videoStreams.forEach { stream ->
@@ -815,12 +847,9 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
                     }
                 }
 
-                // 2. Streams de audio solo (MP3 / M4A)
                 if (audioStreams != null && audioStreams.isNotEmpty()) {
                     val firstAudio = audioStreams[0]
                     val audioUrl = firstAudio.content
-                    val ext = "m4a"
-
                     if (!audioUrl.isNullOrBlank()) {
                         optionsList.add(
                             DownloadOption(
@@ -828,13 +857,12 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                 downloadUrl = audioUrl,
                                 isAudio = true,
                                 quality = "MP3",
-                                extension = ext
+                                extension = "m4a"
                             )
                         )
                     }
                 }
 
-                // 3. Streams de video alta definición (1080p, 720p60, 480p) -> Muxing automático con Audio M4A
                 val videoOnlyStreams = streamInfo.videoOnlyStreams
                 if (videoOnlyStreams != null && videoOnlyStreams.isNotEmpty()) {
                     videoOnlyStreams.forEach { stream ->
@@ -862,7 +890,7 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
                 }
 
                 if (optionsList.isNotEmpty()) {
-                    Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipeExtractor $NEWPIPE_VERSION ÉXITO -> ${optionsList.size} calidades encontradas")
+                    Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipeExtractor ÉXITO -> ${optionsList.size} calidades encontradas")
                     return@withContext Result.success(
                         VideoInfo(
                             id = videoId,
@@ -879,30 +907,120 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
                     )
                 }
             }
-        } catch (e: ContentNotAvailableException) {
-            val msg = e.message ?: ""
-            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] ContentNotAvailableException: $msg")
-            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
-                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
-            }
-            return@withContext Result.failure(Exception("YouTube reportó: $msg"))
-        } catch (e: ParsingException) {
-            val msg = e.message ?: ""
-            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] ParsingException: $msg")
-            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
-                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
-            }
-            return@withContext Result.failure(Exception("Fallo de análisis de YouTube ($msg)."))
         } catch (e: Exception) {
             val msg = e.message ?: ""
-            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] Excepción General: $msg | Class: ${e.javaClass.simpleName}", e)
-            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
-                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
+            Log.w(VideoExtractorRepository.TAG, "[YouTubeExtractor] Excepción NewPipeExtractor: $msg (${e.javaClass.simpleName})")
+            if (msg.contains("LOGIN_REQUIRED", ignoreCase = true) || msg.contains("Sign in to confirm", ignoreCase = true) || msg.contains("bot", ignoreCase = true)) {
+                isBotCheckError = true
             }
-            return@withContext Result.failure(Exception("Error en NewPipeExtractor: $msg (${e.javaClass.simpleName})"))
         }
 
-        return@withContext Result.failure(Exception("No se pudo obtener el video de YouTube. Revisa los logs en Logcat."))
+        // --------------------------------------------------------------------
+        // MÉTODOS 2: Native yt-dlp Executable Engine
+        // --------------------------------------------------------------------
+        try {
+            Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] MÉTODOS 2 -> Native yt-dlp para '$canonicalYoutubeUrl'...")
+            val request = YoutubeDLRequest(canonicalYoutubeUrl)
+            request.addOption("--dump-json")
+            request.addOption("--no-playlist")
+            request.addOption("--user-agent", USER_AGENT_MOBILE)
+            request.addOption("--extractor-retries", "1")
+            request.addOption("--retry-sleep", "5")
+            request.addOption("--no-check-certificates")
+
+            if (hasCookies) {
+                val cookieFile = YouTubeCookieManager.getCookieFile(context)
+                Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] Modo Autenticado -> usando cookies y player_client=default,mweb")
+                request.addOption("--cookies", cookieFile.absolutePath)
+                request.addOption("--extractor-args", "youtube:player_client=default,mweb")
+            } else {
+                Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] Modo Anónimo -> usando player_client=android,ios")
+                request.addOption("--extractor-args", "youtube:player_client=android,ios")
+            }
+
+            val response = YoutubeDL.getInstance().execute(request)
+            val outJson = response.out ?: ""
+
+            if (outJson.isNotBlank() && outJson.startsWith("{")) {
+                val json = JsonParser.parseString(outJson).asJsonObject
+
+                var videoUrl = json.get("url")?.asString ?: ""
+                val title = json.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "YouTube Video"
+                val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "YouTube Channel"
+                val thumb = json.get("thumbnail")?.asString ?: ""
+
+                val optionsList = mutableListOf<DownloadOption>()
+
+                if (json.has("formats")) {
+                    val formats = json.getAsJsonArray("formats")
+                    if (formats != null && formats.size() > 0) {
+                        for (i in 0 until formats.size()) {
+                            val fmt = formats.get(i).asJsonObject
+                            val fmtUrl = fmt.get("url")?.asString ?: ""
+                            val height = if (fmt.has("height") && !fmt.get("height").isJsonNull) fmt.get("height").asInt else 0
+                            val vcodec = fmt.get("vcodec")?.asString ?: ""
+
+                            if (fmtUrl.isNotBlank() && fmtUrl.startsWith("http") && vcodec != "none") {
+                                val label = if (height > 0) "${height}p HD" else "HD"
+                                if (optionsList.none { it.quality == label }) {
+                                    optionsList.add(DownloadOption("Video $label", fmtUrl, isAudio = false, quality = label, extension = "mp4"))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (videoUrl.isBlank() && optionsList.isNotEmpty()) {
+                    videoUrl = optionsList[0].downloadUrl
+                }
+
+                if (optionsList.isEmpty() && videoUrl.isNotBlank()) {
+                    optionsList.add(DownloadOption("Full HD (1080p)", videoUrl, isAudio = false, quality = "1080p", extension = "mp4"))
+                }
+
+                if (videoUrl.isNotBlank()) {
+                    optionsList.add(DownloadOption("Audio MP3", videoUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+                }
+
+                if (videoUrl.isNotBlank() && videoUrl.startsWith("http")) {
+                    Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] Native yt-dlp ÉXITO -> $videoUrl (${optionsList.size} opciones)")
+                    return@withContext Result.success(
+                        VideoInfo(
+                            id = videoId,
+                            title = title,
+                            author = author,
+                            thumbnailUrl = thumb,
+                            downloadUrl = videoUrl,
+                            platform = Platform.YOUTUBE,
+                            quality = optionsList[0].quality,
+                            isWatermarkFree = true,
+                            originalUrl = url,
+                            options = optionsList
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            val fullErr = e.message ?: ""
+            Log.w(VideoExtractorRepository.TAG, "[YouTubeExtractor] Excepción Native yt-dlp: $fullErr")
+            if (fullErr.contains("Sign in to confirm", ignoreCase = true) || fullErr.contains("bot", ignoreCase = true) || fullErr.contains("Precondition check failed", ignoreCase = true)) {
+                isBotCheckError = true
+            }
+        }
+
+        if (isBotCheckError) {
+            blockedVideoIds[videoId] = System.currentTimeMillis()
+            val userMsg = if (hasCookies) {
+                "La sesión expiró, vuelve a iniciar sesión."
+            } else {
+                "YouTube pide verificación. Inicia sesión con Google (cuenta secundaria) o cambia de red."
+            }
+            return@withContext Result.failure(Exception(userMsg))
+        }
+
+        return@withContext Result.failure(
+            Exception("No se pudo obtener el video de YouTube. Intenta de nuevo en unos momentos.")
+        )
     }
 }
 
@@ -1047,147 +1165,347 @@ class InstagramExtractor(private val context: Context) : PlatformExtractor {
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE FACEBOOK
+// EXTRACTOR MODULAR DE FACEBOOK (Expansion + yt-dlp + Crawler Scraper + Embed Plugin)
 // ============================================================================
-class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
+class FacebookExtractor(
+    private val client: OkHttpClient,
+    private val context: Context
+) : PlatformExtractor {
     override val platform = Platform.FACEBOOK
+
+    companion object {
+        private const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        private const val DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        private const val CRAWLER_USER_AGENT = "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+    }
 
     override fun canHandle(url: String): Boolean {
         val lower = url.lowercase()
         return lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com")
     }
 
-    private fun expandUrl(rawUrl: String): String {
-        val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    private fun extractFacebookVideoId(html: String, finalUrl: String): String? {
+        // 1. og:url / og:video
+        val ogPattern = Pattern.compile("<meta\\s+property=[\"']og:(?:url|video(?::secure_url)?)[\"']\\s+content=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html)
+        while (ogPattern.find()) {
+            val ogContent = ogPattern.group(1) ?: ""
+            val m = Pattern.compile("(?:reel|reels|videos|watch/?\\?v=)/(\\d+)", Pattern.CASE_INSENSITIVE).matcher(ogContent)
+            if (m.find()) return m.group(1)
+        }
+
+        // 2. canonical link
+        val canPattern = Pattern.compile("<link\\s+rel=[\"']canonical[\"']\\s+href=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html)
+        if (canPattern.find()) {
+            val canUrl = canPattern.group(1) ?: ""
+            val m = Pattern.compile("(?:reel|reels|videos|watch/?\\?v=)/(\\d+)", Pattern.CASE_INSENSITIVE).matcher(canUrl)
+            if (m.find()) return m.group(1)
+        }
+
+        // 3. regex directa en JSON / HTML
+        val patterns = listOf(
+            Pattern.compile("[\"']video_id[\"']\\s*:\\s*[\"'](\\d+)[\"']", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("[\"']top_level_post_id[\"']\\s*:\\s*[\"'](\\d+)[\"']", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("/reel/(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("/videos/(\\d+)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("watch/\\?v=(\\d+)", Pattern.CASE_INSENSITIVE)
+        )
+        for (p in patterns) {
+            val m = p.matcher(html)
+            if (m.find()) return m.group(1)
+        }
+
+        // 4. regex en la URL final
+        val urlMatcher = Pattern.compile("(?:reel|reels|videos|watch/?\\?v=)/(\\d+)", Pattern.CASE_INSENSITIVE).matcher(finalUrl)
+        if (urlMatcher.find()) return urlMatcher.group(1)
+
+        return null
+    }
+
+    private fun expandFacebookUrl(rawUrl: String): Pair<String, String?> {
+        Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Expandiendo URL inicial: '$rawUrl'")
+
+        val userAgentsToTry = listOf(
+            MOBILE_USER_AGENT,
+            DESKTOP_USER_AGENT,
+            CRAWLER_USER_AGENT
+        )
+
+        for (ua in userAgentsToTry) {
+            try {
+                val request = Request.Builder()
+                    .url(rawUrl)
+                    .addHeader("User-Agent", ua)
+                    .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .addHeader("Accept-Language", "en-US,en;q=0.9")
+                    .addHeader("Sec-Fetch-Mode", "navigate")
+                    .get()
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    val finalUrl = response.request.url.toString()
+                    val html = response.body?.string() ?: ""
+
+                    Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] HTTP Code: ${response.code} (UA: ${ua.take(20)}...) | Tamaño: ${html.length} bytes | Final: '$finalUrl'")
+
+                    val videoId = extractFacebookVideoId(html, finalUrl)
+                    if (!videoId.isNullOrBlank()) {
+                        val canonical = "https://www.facebook.com/reel/$videoId/"
+                        Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Video ID Extraído: '$videoId' | Canonical URL: '$canonical'")
+                        return canonical to videoId
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción expandiendo URL con UA '${ua.take(20)}': ${e.message}")
+            }
+        }
+
+        val clean = rawUrl.split("?")[0].trim()
+        return clean to null
+    }
+
+    private fun unescapeFacebookUrl(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        return raw.replace("\\/", "/")
+            .replace("\\\\/", "/")
+            .replace("\\u0025", "%")
+            .replace("%3A", ":")
+            .replace("%2F", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+            .replace("\\\"", "\"")
+            .trim()
+    }
+
+    private fun isRealVideoUrl(candidateUrl: String?): Boolean {
+        if (candidateUrl.isNullOrBlank()) return false
+        val lower = candidateUrl.lowercase()
+        if (lower.contains("lookaside.fbsbx.com") || lower.contains("fbsbx.com/lookaside") || lower.contains("crawler/media")) return false
+        if (lower.contains(".jpg") || lower.contains(".jpeg") || lower.contains(".png") || lower.contains(".webp")) return false
+        return lower.contains("video.fccp") || lower.contains("video.fcdn") || lower.contains("video.fb") || lower.contains("fbcdn.net") || lower.contains(".mp4")
+    }
+
+    private fun validateFacebookVideoUrl(candidateUrl: String, userAgent: String): Boolean {
+        if (!isRealVideoUrl(candidateUrl)) return false
         try {
             val request = Request.Builder()
-                .url(rawUrl)
-                .addHeader("User-Agent", desktopUserAgent)
+                .url(candidateUrl)
+                .addHeader("User-Agent", userAgent)
+                .addHeader("Range", "bytes=0-1023")
                 .get()
                 .build()
 
             client.newCall(request).execute().use { response ->
-                val finalUrl = response.request.url.toString()
-                if (finalUrl.isNotBlank()) {
-                    val html = response.body?.string() ?: ""
-                    val canonicalMatcher = Pattern.compile("<link\\s+rel=[\"']canonical[\"']\\s+href=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html)
-                    if (canonicalMatcher.find()) {
-                        val canonical = canonicalMatcher.group(1)
-                        if (!canonical.isNullOrBlank() && canonical.contains("facebook.com")) {
-                            return canonical
-                        }
-                    }
-                    return finalUrl
+                val code = response.code
+                val contentType = response.header("Content-Type")?.lowercase() ?: ""
+                val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0L
+
+                Log.d(VideoExtractorRepository.TAG, "[FacebookValidation] Check -> Code: $code | Content-Type: '$contentType' | Length: $contentLength")
+
+                if ((code == 200 || code == 206) && (contentType.startsWith("video/") || contentType.contains("mp4") || contentType.contains("octet-stream"))) {
+                    return true
                 }
             }
         } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción expandiendo URL: ${e.message}")
+            Log.w(VideoExtractorRepository.TAG, "[FacebookValidation] Excepción validando URL candidatada: ${e.message}")
         }
-        return rawUrl
+        return false
     }
 
-    override suspend fun extract(url: String): Result<VideoInfo> {
-        val expandedUrl = expandUrl(url)
-        val cleanUrl = expandedUrl.split("?")[0]
-        Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] URL Original: $url | Expandida: $expandedUrl | Limpia: $cleanUrl")
+    override suspend fun extract(url: String): Result<VideoInfo> = withContext(Dispatchers.IO) {
+        var (canonicalUrl, videoId) = expandFacebookUrl(url)
+        Log.d(VideoExtractorRepository.TAG, "==================================================")
+        Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] URL Original: '$url' | Canonical URL: '$canonicalUrl' | ID: '$videoId'")
 
-        val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        var lastError: Exception? = null
 
-        // 1. Publer Media API
-        try {
-            val jsonPayload = JsonObject().apply {
-                addProperty("url", cleanUrl)
-            }.toString()
+        // --------------------------------------------------------------------
+        // MÉTODOS 1: Native Local yt-dlp Executable Engine
+        // --------------------------------------------------------------------
+        val targetUrlsYtDlp = mutableListOf<String>()
+        if (!videoId.isNullOrBlank()) {
+            targetUrlsYtDlp.add("https://www.facebook.com/reel/$videoId/")
+            targetUrlsYtDlp.add("https://www.facebook.com/watch/?v=$videoId")
+        }
+        if (!targetUrlsYtDlp.contains(canonicalUrl)) targetUrlsYtDlp.add(canonicalUrl)
+        if (!targetUrlsYtDlp.contains(url)) targetUrlsYtDlp.add(url)
 
-            Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Intentando Publer API...")
-            val request = Request.Builder()
-                .url("https://publer.io/api/v1/media/download")
-                .addHeader("User-Agent", desktopUserAgent)
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Accept", "application/json")
-                .addHeader("Origin", "https://publer.io")
-                .addHeader("Referer", "https://publer.io/")
-                .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
+        for (targetUrl in targetUrlsYtDlp) {
+            try {
+                Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] MÉTODOS 1 -> Native yt-dlp para '$targetUrl'...")
+                val request = YoutubeDLRequest(targetUrl)
+                request.addOption("--dump-json")
+                request.addOption("--no-playlist")
+                request.addOption("--user-agent", MOBILE_USER_AGENT)
+                request.addOption("--no-check-certificates")
 
-            client.newCall(request).execute().use { response ->
-                Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Publer HTTP Code: ${response.code}")
-                if (response.isSuccessful) {
-                    val bodyString = response.body?.string() ?: ""
-                    if (bodyString.isNotBlank() && bodyString.startsWith("{")) {
-                        val json = JsonParser.parseString(bodyString).asJsonObject
-                        val path = json.get("path")?.asString
-                            ?: json.get("url")?.asString
-                            ?: json.getAsJsonArray("payload")?.get(0)?.asJsonObject?.get("path")?.asString ?: ""
+                val cookieFile = FacebookCookieManager.getCookieFile(context)
+                if (FacebookCookieManager.hasCookies(context)) {
+                    Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Cargando cookies privadas de Facebook: ${cookieFile.absolutePath}")
+                    request.addOption("--cookies", cookieFile.absolutePath)
+                }
 
-                        if (path.isNotBlank() && path.startsWith("http")) {
-                            val options = listOf(
-                                DownloadOption("Full HD (1080p)", path, isAudio = false, quality = "1080p", extension = "mp4"),
-                                DownloadOption("HD (720p)", path, isAudio = false, quality = "720p", extension = "mp4"),
-                                DownloadOption("SD (480p)", path, isAudio = false, quality = "480p", extension = "mp4"),
-                                DownloadOption("Audio MP3", path, isAudio = true, quality = "MP3", extension = "mp3")
-                            )
+                val response = YoutubeDL.getInstance().execute(request)
+                val outJson = response.out ?: ""
 
-                            Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Publer ÉXITO -> $path")
-                            return Result.success(
-                                VideoInfo(
-                                    id = System.currentTimeMillis().toString(),
-                                    title = "Facebook Video",
-                                    author = "Facebook User",
-                                    thumbnailUrl = "",
-                                    downloadUrl = path,
-                                    platform = Platform.FACEBOOK,
-                                    quality = "1080p Full HD",
-                                    isWatermarkFree = true,
-                                    originalUrl = url,
-                                    options = options
-                                )
-                            )
+                if (outJson.isNotBlank() && outJson.startsWith("{")) {
+                    val json = JsonParser.parseString(outJson).asJsonObject
+
+                    var videoUrl = json.get("url")?.asString ?: ""
+                    val title = json.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "Facebook Video"
+                    val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "Facebook User"
+                    val thumb = json.get("thumbnail")?.asString ?: ""
+
+                    val optionsList = mutableListOf<DownloadOption>()
+
+                    if (json.has("formats")) {
+                        val formats = json.getAsJsonArray("formats")
+                        if (formats != null && formats.size() > 0) {
+                            for (i in 0 until formats.size()) {
+                                val fmt = formats.get(i).asJsonObject
+                                val fmtUrl = fmt.get("url")?.asString ?: ""
+                                val formatNote = fmt.get("format_note")?.asString ?: fmt.get("format_id")?.asString ?: ""
+                                val height = if (fmt.has("height") && !fmt.get("height").isJsonNull) fmt.get("height").asInt else 0
+
+                                if (fmtUrl.isNotBlank() && fmtUrl.startsWith("http") && isRealVideoUrl(fmtUrl)) {
+                                    val label = when {
+                                        formatNote.contains("hd", ignoreCase = true) || height >= 720 -> "HD (${if (height > 0) "${height}p" else "720p"})"
+                                        else -> "SD (${if (height > 0) "${height}p" else "480p"})"
+                                    }
+                                    if (optionsList.none { it.quality == label }) {
+                                        optionsList.add(DownloadOption("Video $label", fmtUrl, isAudio = false, quality = label, extension = "mp4"))
+                                    }
+                                }
+                            }
                         }
                     }
+
+                    if (videoUrl.isBlank() && optionsList.isNotEmpty()) {
+                        videoUrl = optionsList[0].downloadUrl
+                    }
+
+                    if (optionsList.isEmpty() && videoUrl.isNotBlank() && isRealVideoUrl(videoUrl)) {
+                        optionsList.add(DownloadOption("Full HD (1080p)", videoUrl, isAudio = false, quality = "1080p", extension = "mp4"))
+                        optionsList.add(DownloadOption("HD (720p)", videoUrl, isAudio = false, quality = "720p", extension = "mp4"))
+                    }
+
+                    if (videoUrl.isNotBlank() && isRealVideoUrl(videoUrl)) {
+                        optionsList.add(DownloadOption("Audio MP3", videoUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+                    }
+
+                    if (videoUrl.isNotBlank() && isRealVideoUrl(videoUrl)) {
+                        Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Native yt-dlp ÉXITO -> $videoUrl (${optionsList.size} opciones)")
+                        return@withContext Result.success(
+                            VideoInfo(
+                                id = videoId ?: System.currentTimeMillis().toString(),
+                                title = title,
+                                author = author,
+                                thumbnailUrl = thumb,
+                                downloadUrl = videoUrl,
+                                platform = Platform.FACEBOOK,
+                                quality = optionsList[0].quality,
+                                isWatermarkFree = true,
+                                originalUrl = url,
+                                options = optionsList
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                val fullErr = e.message ?: ""
+                Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción Native yt-dlp: $fullErr")
+
+                val idMatcher = Pattern.compile("\\[facebook\\]\\s*(\\d+):", Pattern.CASE_INSENSITIVE).matcher(fullErr)
+                if (idMatcher.find()) {
+                    val capturedId = idMatcher.group(1)
+                    if (!capturedId.isNullOrBlank() && videoId.isNullOrBlank()) {
+                        videoId = capturedId
+                        canonicalUrl = "https://www.facebook.com/reel/$videoId/"
+                        Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] ID Capturado desde error de yt-dlp: '$videoId' | Nueva Canonical: '$canonicalUrl'")
+                    }
+                }
+
+                if (fullErr.contains("login", ignoreCase = true) || fullErr.contains("private", ignoreCase = true)) {
+                    lastError = Exception("El video de Facebook es privado o requiere inicio de sesión.")
                 }
             }
-        } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción Publer: ${e.message}")
         }
 
-        // 2. Facebook MBasic Scraper
-        try {
-            val mobileUserAgent = "Mozilla/5.0 (Android 13; Mobile; rv:122.0) Gecko/122.0 Firefox/122.0"
-            val mbasicUrl = cleanUrl.replace("www.facebook.com", "mbasic.facebook.com")
-                .replace("m.facebook.com", "mbasic.facebook.com")
+        // --------------------------------------------------------------------
+        // MÉTODOS 2: Facebook Crawler Scraper (`facebookexternalhit`)
+        // --------------------------------------------------------------------
+        if (!videoId.isNullOrBlank()) {
+            val crawlerUrlsToScrape = listOf(
+                "https://www.facebook.com/reel/$videoId/",
+                "https://m.facebook.com/reel/$videoId/"
+            )
 
-            Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Intentando MBasic: $mbasicUrl")
-            val request = Request.Builder()
-                .url(mbasicUrl)
-                .addHeader("User-Agent", mobileUserAgent)
-                .build()
+            for (scrapeUrl in crawlerUrlsToScrape) {
+                try {
+                    Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] MÉTODOS 2 -> Facebook Crawler Scraper (facebookexternalhit): $scrapeUrl")
+                    val request = Request.Builder()
+                        .url(scrapeUrl)
+                        .addHeader("User-Agent", CRAWLER_USER_AGENT)
+                        .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                        .addHeader("Accept-Language", "en-US,en;q=0.9")
+                        .get()
+                        .build()
 
-            client.newCall(request).execute().use { response ->
-                Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] MBasic HTTP Code: ${response.code}")
-                if (response.isSuccessful) {
-                    val html = response.body?.string() ?: ""
-                    val redirectMatcher = Pattern.compile("href=[\"']/video_redirect/\\?src=([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html)
-                    if (redirectMatcher.find()) {
-                        val rawEncodedUrl = redirectMatcher.group(1)
-                        if (!rawEncodedUrl.isNullOrBlank()) {
-                            val decodedUrl = URLDecoder.decode(rawEncodedUrl, "UTF-8").replace("&amp;", "&")
-                            if (decodedUrl.startsWith("http")) {
-                                val options = listOf(
-                                    DownloadOption("Video MP4 (HD)", decodedUrl, isAudio = false, quality = "HD", extension = "mp4"),
-                                    DownloadOption("Audio MP3", decodedUrl, isAudio = true, quality = "MP3", extension = "mp3")
-                                )
+                    client.newCall(request).execute().use { response ->
+                        val responseCode = response.code
+                        val finalScrapeUrl = response.request.url.toString()
+                        val html = response.body?.string() ?: ""
 
-                                Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] MBasic ÉXITO -> $decodedUrl")
-                                return Result.success(
+                        Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Crawler Scraper HTTP $responseCode | Tamaño: ${html.length} bytes | Final: '$finalScrapeUrl'")
+
+                        val isLoginRequired = finalScrapeUrl.contains("/login") || html.contains("log in to continue", ignoreCase = true) || html.contains("You must log in", ignoreCase = true) || html.contains("This content isn't available", ignoreCase = true)
+                        if (isLoginRequired) {
+                            Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Muro de inicio de sesión detectado en Crawler Scraper: $scrapeUrl")
+                            lastError = Exception("El video de Facebook es privado o requiere inicio de sesión.")
+                        } else if (response.isSuccessful && html.isNotBlank()) {
+                            var hdUrl: String? = null
+                            var sdUrl: String? = null
+
+                            val patterns = listOf(
+                                Pattern.compile("[\"']og:video:secure_url[\"']\\s+content=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']og:video:url[\"']\\s+content=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']og:video[\"']\\s+content=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']browser_native_hd_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']playable_url_quality_hd[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']browser_native_sd_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                                Pattern.compile("[\"']playable_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)
+                            )
+
+                            for (p in patterns) {
+                                val m = p.matcher(html)
+                                if (m.find()) {
+                                    val candidate = unescapeFacebookUrl(m.group(1))
+                                    if (isRealVideoUrl(candidate)) {
+                                        if (candidate!!.contains("hd") || candidate.contains("quality_hd")) {
+                                            if (hdUrl == null) hdUrl = candidate
+                                        } else {
+                                            if (sdUrl == null) sdUrl = candidate
+                                        }
+                                    }
+                                }
+                            }
+
+                            val bestMediaUrl = hdUrl ?: sdUrl
+                            if (!bestMediaUrl.isNullOrBlank() && validateFacebookVideoUrl(bestMediaUrl, CRAWLER_USER_AGENT)) {
+                                val options = mutableListOf<DownloadOption>()
+                                if (!hdUrl.isNullOrBlank()) options.add(DownloadOption("Full HD (1080p)", hdUrl, isAudio = false, quality = "1080p", extension = "mp4"))
+                                if (!sdUrl.isNullOrBlank()) options.add(DownloadOption("SD (480p)", sdUrl, isAudio = false, quality = "480p", extension = "mp4"))
+                                options.add(DownloadOption("Audio MP3", bestMediaUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+
+                                Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Crawler Scraper ÉXITO -> $bestMediaUrl")
+                                return@withContext Result.success(
                                     VideoInfo(
-                                        id = System.currentTimeMillis().toString(),
+                                        id = videoId,
                                         title = "Facebook Video",
                                         author = "Facebook User",
                                         thumbnailUrl = "",
-                                        downloadUrl = decodedUrl,
+                                        downloadUrl = bestMediaUrl,
                                         platform = Platform.FACEBOOK,
-                                        quality = "HD",
+                                        quality = if (!hdUrl.isNullOrBlank()) "1080p Full HD" else "SD",
                                         isWatermarkFree = true,
                                         originalUrl = url,
                                         options = options
@@ -1196,12 +1514,127 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
                             }
                         }
                     }
+                } catch (e: Exception) {
+                    Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción Crawler Scraper ($scrapeUrl): ${e.message}")
                 }
             }
-        } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción MBasic: ${e.message}")
         }
 
-        return Result.failure(Exception("No se pudo extraer el video de Facebook."))
+        // --------------------------------------------------------------------
+        // MÉTODOS 3: Facebook Video Plugin Embed Scraper
+        // --------------------------------------------------------------------
+        if (!videoId.isNullOrBlank()) {
+            try {
+                val targetEmbed = "https://www.facebook.com/reel/$videoId/"
+                val encodedTarget = URLEncoder.encode(targetEmbed, "UTF-8")
+                val embedPluginUrl = "https://www.facebook.com/plugins/video.php?href=$encodedTarget&show_text=false"
+                Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] MÉTODOS 3 -> Facebook Plugin Embed Scraper: $embedPluginUrl")
+
+                val request = Request.Builder()
+                    .url(embedPluginUrl)
+                    .addHeader("User-Agent", CRAWLER_USER_AGENT)
+                    .addHeader("Accept-Language", "en-US,en;q=0.9")
+                    .get()
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    val responseCode = response.code
+                    val html = response.body?.string() ?: ""
+
+                    Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Embed Plugin HTTP Code: $responseCode | Tamaño: ${html.length} bytes")
+
+                    if (response.isSuccessful && html.isNotBlank()) {
+                        var hdUrl: String? = null
+                        var sdUrl: String? = null
+
+                        val hdPatterns = listOf(
+                            Pattern.compile("[\"']hd_src[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']hd_src_no_ratelimit[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']browser_native_hd_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']playable_url_quality_hd[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)
+                        )
+
+                        for (hp in hdPatterns) {
+                            val m = hp.matcher(html)
+                            if (m.find()) {
+                                val candidate = unescapeFacebookUrl(m.group(1))
+                                if (isRealVideoUrl(candidate)) {
+                                    hdUrl = candidate
+                                    break
+                                }
+                            }
+                        }
+
+                        val sdPatterns = listOf(
+                            Pattern.compile("[\"']sd_src[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']sd_src_no_ratelimit[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']browser_native_sd_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE),
+                            Pattern.compile("[\"']playable_url[\"']\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)
+                        )
+
+                        for (sp in sdPatterns) {
+                            val m = sp.matcher(html)
+                            if (m.find()) {
+                                val candidate = unescapeFacebookUrl(m.group(1))
+                                if (isRealVideoUrl(candidate)) {
+                                    sdUrl = candidate
+                                    break
+                                }
+                            }
+                        }
+
+                        if (hdUrl.isNullOrBlank() && sdUrl.isNullOrBlank()) {
+                            val ogPattern = Pattern.compile("<meta\\s+property=[\"']og:video(?::secure_url)?[\"']\\s+content=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(html)
+                            if (ogPattern.find()) {
+                                val candidate = unescapeFacebookUrl(ogPattern.group(1))
+                                if (isRealVideoUrl(candidate)) {
+                                    sdUrl = candidate
+                                }
+                            }
+                        }
+
+                        val bestMediaUrl = hdUrl ?: sdUrl
+                        if (!bestMediaUrl.isNullOrBlank() && validateFacebookVideoUrl(bestMediaUrl, CRAWLER_USER_AGENT)) {
+                            val options = mutableListOf<DownloadOption>()
+                            if (!hdUrl.isNullOrBlank()) options.add(DownloadOption("Full HD (1080p)", hdUrl, isAudio = false, quality = "1080p", extension = "mp4"))
+                            if (!sdUrl.isNullOrBlank()) options.add(DownloadOption("SD (480p)", sdUrl, isAudio = false, quality = "480p", extension = "mp4"))
+                            options.add(DownloadOption("Audio MP3", bestMediaUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+
+                            Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Embed Plugin ÉXITO -> $bestMediaUrl")
+                            return@withContext Result.success(
+                                VideoInfo(
+                                    id = videoId,
+                                    title = "Facebook Video",
+                                    author = "Facebook User",
+                                    thumbnailUrl = "",
+                                    downloadUrl = bestMediaUrl,
+                                    platform = Platform.FACEBOOK,
+                                    quality = if (!hdUrl.isNullOrBlank()) "1080p Full HD" else "SD",
+                                    isWatermarkFree = true,
+                                    originalUrl = url,
+                                    options = options
+                                )
+                            )
+                        } else {
+                            val idx = html.indexOf("video", ignoreCase = true)
+                            val snippet = if (idx >= 0) {
+                                val start = maxOf(0, idx - 100)
+                                val end = minOf(html.length, idx + 200)
+                                html.substring(start, end).replace("\n", " ").replace("\r", " ")
+                            } else {
+                                html.take(300)
+                            }
+                            Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Embed Plugin no encontró coincidencias de video válidas. Fragmento alrededor de 'video': ... $snippet ...")
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(VideoExtractorRepository.TAG, "[FacebookExtractor] Excepción Embed Plugin Scraper: ${e.message}")
+            }
+        }
+
+        return@withContext Result.failure(
+            lastError ?: Exception("No se pudo extraer el video de Facebook. Verifica que el enlace sea de un Reel o video público.")
+        )
     }
 }

@@ -66,7 +66,6 @@ fun PlatformBadge(platform: Platform) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VideoPreviewCard(
     videoInfo: VideoInfo,
@@ -175,32 +174,54 @@ fun VideoPreviewCard(
                 color = MaterialTheme.colorScheme.primary
             )
 
-            // Selector Desplegable Único (Dropdown Select)
-            ExposedDropdownMenuBox(
-                expanded = expanded,
-                onExpandedChange = { expanded = !expanded },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                OutlinedTextField(
-                    value = selectedOption?.let { opt ->
-                        if (opt.isAudio) "🎵 ${opt.label}" else "🎥 ${opt.label}"
-                    } ?: "",
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("Calidad de Video / Audio") },
-                    trailingIcon = {
-                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
-                    },
-                    colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+            // Selector Desplegable Seguro a prueba de crashes
+            Box(modifier = Modifier.fillMaxWidth()) {
+                OutlinedCard(
+                    onClick = { expanded = !expanded },
+                    modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, true)
-                )
+                    colors = CardDefaults.outlinedCardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (selectedOption?.isAudio == true) Icons.Default.Audiotrack else Icons.Default.Movie,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = selectedOption?.let { opt ->
+                                    if (opt.isAudio) "🎵 ${opt.label}" else "🎥 ${opt.label}"
+                                } ?: "Selecciona calidad",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 15.sp
+                            )
+                        }
 
-                ExposedDropdownMenu(
+                        Icon(
+                            imageVector = if (expanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                DropdownMenu(
                     expanded = expanded,
-                    onDismissRequest = { expanded = false }
+                    onDismissRequest = { expanded = false },
+                    modifier = Modifier.fillMaxWidth(0.85f)
                 ) {
                     defaultOptions.forEachIndexed { index, option ->
                         DropdownMenuItem(
@@ -225,8 +246,7 @@ fun VideoPreviewCard(
                             onClick = {
                                 selectedOptionIndex = index
                                 expanded = false
-                            },
-                            contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                            }
                         )
                     }
                 }
