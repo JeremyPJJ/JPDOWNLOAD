@@ -1,15 +1,27 @@
 package com.example.videodownload.data.repository
 
 import android.util.Log
+import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.*
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
+import org.schabi.newpipe.extractor.exceptions.ParsingException
+import org.schabi.newpipe.extractor.stream.StreamInfo
 import java.net.URLDecoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -92,99 +104,10 @@ class VideoExtractorRepository {
                 return@withContext result
             }
             Log.w(TAG, "[extractVideoInfo] ${targetExtractor.javaClass.simpleName} falló: ${result.exceptionOrNull()?.message}")
+            return@withContext result
         }
 
-        // Fallback Multi-Plataforma si el extractor dedicado no tuvo éxito
-        Log.w(TAG, "[extractVideoInfo] Ejecutando Cobalt Multi-Platform Fallback...")
-        extractMultiPlatform(firstUrl, platform)
-    }
-
-    private fun extractMultiPlatform(rawUrl: String, platform: Platform): Result<VideoInfo> {
-        val cleanUrl = rawUrl.split("?")[0].replace("x.com", "twitter.com")
-        val cobaltInstances = listOf(
-            "https://api.cobalt.tools/",
-            "https://cobalt-api.kwiatek.xyz/",
-            "https://co.wuk.sh/"
-        )
-
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-
-        for (instanceUrl in cobaltInstances) {
-            try {
-                Log.d(TAG, "[Cobalt Fallback] Endpoint: $instanceUrl | URL: $cleanUrl")
-
-                val jsonPayload = JsonObject().apply {
-                    addProperty("url", cleanUrl)
-                    addProperty("videoQuality", "720")
-                }.toString()
-
-                val request = Request.Builder()
-                    .url(instanceUrl)
-                    .header("Accept", "application/json")
-                    .header("Content-Type", "application/json")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                    .post(jsonPayload.toRequestBody(mediaType))
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    val code = response.code
-                    val bodyString = response.body?.string() ?: ""
-                    Log.d(TAG, "[Cobalt Fallback] Code: $code | Body Length: ${bodyString.length}")
-
-                    if (response.isSuccessful && bodyString.isNotBlank()) {
-                        val json = JsonParser.parseString(bodyString).asJsonObject
-                        val status = json.get("status")?.asString ?: ""
-
-                        if (status == "redirect" || status == "stream" || status == "tunnel") {
-                            val downloadUrl = json.get("url")?.asString ?: ""
-                            if (downloadUrl.isNotBlank()) {
-                                Log.i(TAG, "[Cobalt Fallback] ÉXITO -> Video URL: $downloadUrl")
-                                return Result.success(
-                                    VideoInfo(
-                                        id = System.currentTimeMillis().toString(),
-                                        title = "${platform.displayName} Video",
-                                        author = platform.displayName,
-                                        thumbnailUrl = "",
-                                        downloadUrl = downloadUrl,
-                                        platform = platform,
-                                        quality = "HD",
-                                        isWatermarkFree = true,
-                                        originalUrl = rawUrl
-                                    )
-                                )
-                            }
-                        } else if (status == "picker") {
-                            val pickerArray = json.getAsJsonArray("picker")
-                            if (pickerArray != null && pickerArray.size() > 0) {
-                                val firstItem = pickerArray.get(0).asJsonObject
-                                val downloadUrl = firstItem.get("url")?.asString ?: ""
-                                val thumb = firstItem.get("thumb")?.asString ?: ""
-                                if (downloadUrl.isNotBlank()) {
-                                    Log.i(TAG, "[Cobalt Fallback] ÉXITO (Picker) -> Video URL: $downloadUrl")
-                                    return Result.success(
-                                        VideoInfo(
-                                            id = System.currentTimeMillis().toString(),
-                                            title = "${platform.displayName} Video",
-                                            author = platform.displayName,
-                                            thumbnailUrl = thumb,
-                                            downloadUrl = downloadUrl,
-                                            platform = platform,
-                                            quality = "HD",
-                                            isWatermarkFree = true,
-                                            originalUrl = rawUrl
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "[Cobalt Fallback] Excepción: ${e.message}")
-            }
-        }
-
-        return Result.failure(Exception("No se pudo obtener el video de ${platform.displayName}. Comprueba que el enlace sea público."))
+        return@withContext Result.failure(Exception("No se pudo detectar un extractor para la plataforma."))
     }
 
     private fun extractFirstUrl(text: String): String? {
@@ -213,7 +136,7 @@ class TikTokExtractor(private val client: OkHttpClient) : PlatformExtractor {
         val apiUrl = "https://www.tikwm.com/api/?url=${url}"
         val request = Request.Builder()
             .url(apiUrl)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .build()
 
         try {
@@ -233,15 +156,30 @@ class TikTokExtractor(private val client: OkHttpClient) : PlatformExtractor {
                     val title = data.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "TikTok Video"
                     val cover = data.get("cover")?.asString ?: ""
                     var playUrl = data.get("play")?.asString ?: ""
+                    var musicUrl = data.get("music")?.asString ?: ""
 
                     if (playUrl.startsWith("/")) {
                         playUrl = "https://www.tikwm.com$playUrl"
+                    }
+                    if (musicUrl.startsWith("/")) {
+                        musicUrl = "https://www.tikwm.com$musicUrl"
                     }
 
                     val authorObj = data.getAsJsonObject("author")
                     val author = authorObj?.get("nickname")?.asString
                         ?: authorObj?.get("unique_id")?.asString
                         ?: "TikTok User"
+
+                    val options = mutableListOf(
+                        DownloadOption("Full HD (1080p)", playUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                        DownloadOption("HD (720p)", playUrl, isAudio = false, quality = "720p", extension = "mp4")
+                    )
+
+                    if (musicUrl.isNotBlank()) {
+                        options.add(DownloadOption("Audio MP3", musicUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+                    } else {
+                        options.add(DownloadOption("Audio MP3", playUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+                    }
 
                     val videoInfo = VideoInfo(
                         id = id,
@@ -250,9 +188,10 @@ class TikTokExtractor(private val client: OkHttpClient) : PlatformExtractor {
                         thumbnailUrl = cover,
                         downloadUrl = playUrl,
                         platform = Platform.TIKTOK,
-                        quality = "HD (Sin Marca de Agua)",
+                        quality = "1080p Full HD",
                         isWatermarkFree = true,
-                        originalUrl = url
+                        originalUrl = url,
+                        options = options
                     )
                     Log.i(VideoExtractorRepository.TAG, "[TikTokExtractor] ÉXITO -> $playUrl")
                     return Result.success(videoInfo)
@@ -290,7 +229,6 @@ class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
             return Result.failure(Exception("No se pudo extraer el ID del Tweet de Twitter/X."))
         }
 
-        val twitterUrl = "https://twitter.com/i/status/$statusId"
         val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
         // 1. VxTwitter API
@@ -305,7 +243,7 @@ class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
                 Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Intentando VxTwitter API: $vxUrl")
                 val request = Request.Builder()
                     .url(vxUrl)
-                    .header("User-Agent", desktopUserAgent)
+                    .addHeader("User-Agent", desktopUserAgent)
                     .build()
 
                 client.newCall(request).execute().use { response ->
@@ -328,6 +266,12 @@ class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                     val thumb = media.get("thumbnail_url")?.asString ?: ""
 
                                     if (videoUrl.isNotBlank() && (type == "video" || type == "gif" || videoUrl.contains(".mp4"))) {
+                                        val options = listOf(
+                                            DownloadOption("Full HD (1080p)", videoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                                            DownloadOption("HD (720p)", videoUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                                            DownloadOption("Audio MP3", videoUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                                        )
+
                                         Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] VxTwitter ÉXITO -> $videoUrl")
                                         return Result.success(
                                             VideoInfo(
@@ -337,9 +281,10 @@ class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                                 thumbnailUrl = thumb,
                                                 downloadUrl = videoUrl,
                                                 platform = Platform.TWITTER,
-                                                quality = "HD",
+                                                quality = "1080p Full HD",
                                                 isWatermarkFree = true,
-                                                originalUrl = url
+                                                originalUrl = url,
+                                                options = options
                                             )
                                         )
                                     }
@@ -353,135 +298,101 @@ class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
             }
         }
 
-        // 2. FxTwitter API
-        val fxEndpoints = listOf(
-            "https://api.fxtwitter.com/status/$statusId",
-            "https://api.fxtwitter.com/i/status/$statusId"
-        )
-
-        for (fxUrl in fxEndpoints) {
-            try {
-                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Intentando FxTwitter API: $fxUrl")
-                val request = Request.Builder()
-                    .url(fxUrl)
-                    .header("User-Agent", desktopUserAgent)
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter HTTP Code: ${response.code}")
-                    if (response.isSuccessful) {
-                        val body = response.body?.string() ?: ""
-                        if (body.isNotBlank() && body.startsWith("{")) {
-                            val json = JsonParser.parseString(body).asJsonObject
-                            val tweet = json.getAsJsonObject("tweet")
-                            if (tweet != null) {
-                                val text = tweet.get("text")?.asString ?: "Twitter / X Video"
-                                val authorObj = tweet.getAsJsonObject("author")
-                                val author = authorObj?.get("name")?.asString ?: "Twitter User"
-                                val mediaObj = tweet.getAsJsonObject("media")
-                                val videos = mediaObj?.getAsJsonArray("videos")
-                                if (videos != null && videos.size() > 0) {
-                                    val video = videos.get(0).asJsonObject
-                                    val videoUrl = video.get("url")?.asString ?: ""
-                                    val thumb = video.get("thumbnail_url")?.asString ?: ""
-                                    if (videoUrl.isNotBlank()) {
-                                        Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter ÉXITO -> $videoUrl")
-                                        return Result.success(
-                                            VideoInfo(
-                                                id = statusId,
-                                                title = text,
-                                                author = author,
-                                                thumbnailUrl = thumb,
-                                                downloadUrl = videoUrl,
-                                                platform = Platform.TWITTER,
-                                                quality = "HD",
-                                                isWatermarkFree = true,
-                                                originalUrl = url
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción en FxTwitter: ${e.message}")
-            }
-        }
-
-        // 3. Publer Media API
-        try {
-            val jsonPayload = JsonObject().apply {
-                addProperty("url", twitterUrl)
-            }.toString()
-
-            Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Intentando Publer API...")
-            val request = Request.Builder()
-                .url("https://publer.io/api/v1/media/download")
-                .header("User-Agent", desktopUserAgent)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Origin", "https://publer.io")
-                .header("Referer", "https://publer.io/")
-                .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Publer HTTP Code: ${response.code}")
-                if (response.isSuccessful) {
-                    val bodyString = response.body?.string() ?: ""
-                    if (bodyString.isNotBlank() && bodyString.startsWith("{")) {
-                        val json = JsonParser.parseString(bodyString).asJsonObject
-                        val path = json.get("path")?.asString
-                            ?: json.get("url")?.asString
-                            ?: json.getAsJsonArray("payload")?.get(0)?.asJsonObject?.get("path")?.asString ?: ""
-
-                        if (path.isNotBlank() && path.startsWith("http")) {
-                            Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] Publer ÉXITO -> $path")
-                            return Result.success(
-                                VideoInfo(
-                                    id = statusId,
-                                    title = "Twitter / X Video",
-                                    author = "Twitter User",
-                                    thumbnailUrl = "",
-                                    downloadUrl = path,
-                                    platform = Platform.TWITTER,
-                                    quality = "HD",
-                                    isWatermarkFree = true,
-                                    originalUrl = url
-                                )
-                            )
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción Publer: ${e.message}")
-        }
-
         return Result.failure(Exception("No se pudo obtener el video de Twitter/X."))
     }
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE YOUTUBE (Invidious REST API + Cobalt)
+// EXTRACTOR MODULAR DE YOUTUBE (NewPipeExtractor v0.26.5 con Muxer de Audio)
 // ============================================================================
+class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
+
+    private val cookieMap = ConcurrentHashMap<String, String>()
+
+    override fun execute(request: org.schabi.newpipe.extractor.downloader.Request): org.schabi.newpipe.extractor.downloader.Response {
+        val httpMethod = request.httpMethod()
+        val url = request.url()
+        val headers = request.headers()
+        val dataToSend = request.dataToSend()
+
+        val requestBuilder = Request.Builder()
+            .url(url)
+            .addHeader("User-Agent", "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36")
+            .addHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
+
+        headers?.forEach { (key, values) ->
+            values.forEach { value ->
+                requestBuilder.addHeader(key, value)
+            }
+        }
+
+        val host = try { url.toHttpUrl().host } catch (_: Exception) { "" }
+        if (host.isNotBlank() && cookieMap.containsKey(host)) {
+            requestBuilder.addHeader("Cookie", cookieMap[host] ?: "")
+        }
+
+        val body = dataToSend?.toRequestBody("application/json; charset=utf-8".toMediaType())
+        when (httpMethod) {
+            "GET" -> requestBuilder.get()
+            "POST" -> requestBuilder.post(body ?: "".toRequestBody())
+            "HEAD" -> requestBuilder.head()
+            else -> requestBuilder.method(httpMethod, body)
+        }
+
+        client.newCall(requestBuilder.build()).execute().use { response ->
+            val responseCode = response.code
+            val responseMessage = response.message
+            val responseHeaders = mutableMapOf<String, List<String>>()
+
+            response.headers.names().forEach { name ->
+                responseHeaders[name] = response.headers(name)
+            }
+
+            val setCookie = response.headers("Set-Cookie")
+            if (setCookie.isNotEmpty()) {
+                val combinedCookie = setCookie.joinToString("; ")
+                if (host.isNotBlank()) {
+                    cookieMap[host] = combinedCookie
+                }
+            }
+
+            val responseBody = response.body?.string() ?: ""
+
+            Log.d(VideoExtractorRepository.TAG, "[NewPipeDownloader] HTTP $responseCode | URL: $url | Body (200 chars): ${responseBody.take(200)}")
+
+            return org.schabi.newpipe.extractor.downloader.Response(responseCode, responseMessage, responseHeaders, responseBody, url)
+        }
+    }
+}
+
 class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
     override val platform = Platform.YOUTUBE
+
+    companion object {
+        const val NEWPIPE_VERSION = "v0.26.5"
+    }
+
+    init {
+        try {
+            NewPipe.init(NewPipeOkHttpDownloader(client))
+            Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipe.init() inicializado | Versión: $NEWPIPE_VERSION")
+        } catch (e: Exception) {
+            Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipe.init notice: ${e.message}")
+        }
+    }
 
     override fun canHandle(url: String): Boolean {
         val lower = url.lowercase()
         return lower.contains("youtube.com") || lower.contains("youtu.be")
     }
 
-    private fun extractVideoId(url: String): String? {
+    private fun extractVideoId(rawUrl: String): String? {
         val patterns = listOf(
             Pattern.compile("(?:v=|/videos/|embed/|shorts/|youtu\\.be/)([A-Za-z0-9_-]{11})", Pattern.CASE_INSENSITIVE),
             Pattern.compile("^([A-Za-z0-9_-]{11})$")
         )
         for (pattern in patterns) {
-            val matcher = pattern.matcher(url)
+            val matcher = pattern.matcher(rawUrl)
             if (matcher.find()) {
                 return matcher.group(1)
             }
@@ -489,79 +400,149 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
         return null
     }
 
-    override suspend fun extract(url: String): Result<VideoInfo> {
+    override suspend fun extract(url: String): Result<VideoInfo> = withContext(Dispatchers.IO) {
         val videoId = extractVideoId(url)
-        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Procesando URL: $url | Video ID: $videoId")
+        val canonicalYoutubeUrl = if (!videoId.isNullOrBlank()) "https://www.youtube.com/watch?v=$videoId" else url.split("?")[0]
 
-        if (!videoId.isNullOrBlank()) {
-            val invidiousInstances = listOf(
-                "https://inv.tux.pizza/api/v1/videos/$videoId",
-                "https://vid.puffyan.us/api/v1/videos/$videoId",
-                "https://invidious.drgns.space/api/v1/videos/$videoId"
-            )
+        Log.d(VideoExtractorRepository.TAG, "==================================================")
+        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipeExtractor Versión En Uso: $NEWPIPE_VERSION")
+        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Raw URL: '$url'")
+        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Extracted Video ID: '$videoId'")
+        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Canonical YouTube URL: '$canonicalYoutubeUrl'")
 
-            for (apiUrl in invidiousInstances) {
-                try {
-                    Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Consultado Invidious API: $apiUrl")
-                    val request = Request.Builder()
-                        .url(apiUrl)
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                        .build()
+        if (videoId.isNullOrBlank()) {
+            return@withContext Result.failure(Exception("No se pudo extraer el ID del video de YouTube."))
+        }
 
-                    client.newCall(request).execute().use { response ->
-                        Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] HTTP Code: ${response.code}")
-                        if (response.isSuccessful) {
-                            val body = response.body?.string() ?: ""
-                            if (body.isNotBlank() && body.startsWith("{")) {
-                                val json = JsonParser.parseString(body).asJsonObject
-                                val title = json.get("title")?.asString ?: "YouTube Video"
-                                val author = json.get("author")?.asString ?: "YouTube Channel"
+        // METODO 1: NewPipeExtractor v0.26.5
+        try {
+            Log.d(VideoExtractorRepository.TAG, "[YouTubeExtractor] Ejecutando NewPipeExtractor $NEWPIPE_VERSION para '$canonicalYoutubeUrl'...")
+            val streamInfo = StreamInfo.getInfo(ServiceList.YouTube, canonicalYoutubeUrl)
 
-                                var thumbnailUrl = ""
-                                val thumbs = json.getAsJsonArray("videoThumbnails")
-                                if (thumbs != null && thumbs.size() > 0) {
-                                    thumbnailUrl = thumbs.get(0).asJsonObject.get("url")?.asString ?: ""
-                                }
+            if (streamInfo != null) {
+                val title = streamInfo.name ?: "YouTube Video"
+                val uploader = streamInfo.uploaderName ?: "YouTube Channel"
+                val thumb = streamInfo.thumbnails.firstOrNull()?.url ?: ""
 
-                                val formatStreams = json.getAsJsonArray("formatStreams")
-                                if (formatStreams != null && formatStreams.size() > 0) {
-                                    for (i in formatStreams.size() - 1 downTo 0) {
-                                        val stream = formatStreams.get(i).asJsonObject
-                                        val videoUrl = stream.get("url")?.asString ?: ""
-                                        val quality = stream.get("qualityLabel")?.asString ?: "720p"
+                val optionsList = mutableListOf<DownloadOption>()
 
-                                        if (videoUrl.isNotBlank() && videoUrl.startsWith("http")) {
-                                            Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] ÉXITO -> $videoUrl")
-                                            return Result.success(
-                                                VideoInfo(
-                                                    id = videoId,
-                                                    title = title,
-                                                    author = author,
-                                                    thumbnailUrl = thumbnailUrl,
-                                                    downloadUrl = videoUrl,
-                                                    platform = Platform.YOUTUBE,
-                                                    quality = quality,
-                                                    isWatermarkFree = true,
-                                                    originalUrl = url
-                                                )
-                                            )
-                                        }
-                                    }
-                                }
-                            }
+                // Obtener la mejor pista de audio M4A/AAC para unificar con videos DASH
+                val audioStreams = streamInfo.audioStreams
+                val bestAudioUrl = audioStreams?.firstOrNull()?.content
+
+                // 1. Streams de video combinados (Progressive MP4 - Video + Audio integrados)
+                val videoStreams = streamInfo.videoStreams
+                if (videoStreams != null && videoStreams.isNotEmpty()) {
+                    videoStreams.forEach { stream ->
+                        val streamUrl = stream.content
+                        val resolution = stream.resolution ?: "720p"
+                        if (!streamUrl.isNullOrBlank()) {
+                            optionsList.add(
+                                DownloadOption(
+                                    label = "$resolution HD",
+                                    downloadUrl = streamUrl,
+                                    isAudio = false,
+                                    quality = resolution,
+                                    extension = "mp4"
+                                )
+                            )
                         }
                     }
-                } catch (e: Exception) {
-                    Log.w(VideoExtractorRepository.TAG, "[YouTubeExtractor] Excepción en Invidious: ${e.message}")
+                }
+
+                // 2. Streams de audio solo (MP3 / M4A)
+                if (audioStreams != null && audioStreams.isNotEmpty()) {
+                    val firstAudio = audioStreams[0]
+                    val audioUrl = firstAudio.content
+                    val ext = "m4a"
+
+                    if (!audioUrl.isNullOrBlank()) {
+                        optionsList.add(
+                            DownloadOption(
+                                label = "Audio MP3",
+                                downloadUrl = audioUrl,
+                                isAudio = true,
+                                quality = "MP3",
+                                extension = ext
+                            )
+                        )
+                    }
+                }
+
+                // 3. Streams de video alta definición (1080p, 720p60, 480p) -> Muxing automático con Audio M4A
+                val videoOnlyStreams = streamInfo.videoOnlyStreams
+                if (videoOnlyStreams != null && videoOnlyStreams.isNotEmpty()) {
+                    videoOnlyStreams.forEach { stream ->
+                        val streamUrl = stream.content
+                        val resolution = stream.resolution ?: "1080p"
+                        if (!streamUrl.isNullOrBlank() && optionsList.none { it.quality == resolution }) {
+                            val cleanLabel = when {
+                                resolution.contains("1080") -> "1080p Full HD"
+                                resolution.contains("1440") -> "1440p 2K"
+                                resolution.contains("2160") || resolution.contains("4k") -> "4K Ultra HD"
+                                else -> "$resolution HD"
+                            }
+                            optionsList.add(
+                                DownloadOption(
+                                    label = cleanLabel,
+                                    downloadUrl = streamUrl,
+                                    isAudio = false,
+                                    quality = resolution,
+                                    extension = "mp4",
+                                    audioDownloadUrl = bestAudioUrl
+                                )
+                            )
+                        }
+                    }
+                }
+
+                if (optionsList.isNotEmpty()) {
+                    Log.i(VideoExtractorRepository.TAG, "[YouTubeExtractor] NewPipeExtractor $NEWPIPE_VERSION ÉXITO -> ${optionsList.size} calidades encontradas")
+                    return@withContext Result.success(
+                        VideoInfo(
+                            id = videoId,
+                            title = title,
+                            author = uploader,
+                            thumbnailUrl = thumb,
+                            downloadUrl = optionsList[0].downloadUrl,
+                            platform = Platform.YOUTUBE,
+                            quality = optionsList[0].quality,
+                            isWatermarkFree = true,
+                            originalUrl = url,
+                            options = optionsList
+                        )
+                    )
                 }
             }
+        } catch (e: ContentNotAvailableException) {
+            val msg = e.message ?: ""
+            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] ContentNotAvailableException: $msg")
+            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
+                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
+            }
+            return@withContext Result.failure(Exception("YouTube reportó: $msg"))
+        } catch (e: ParsingException) {
+            val msg = e.message ?: ""
+            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] ParsingException: $msg")
+            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
+                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
+            }
+            return@withContext Result.failure(Exception("Fallo de análisis de YouTube ($msg)."))
+        } catch (e: Exception) {
+            val msg = e.message ?: ""
+            Log.e(VideoExtractorRepository.TAG, "[YouTubeExtractor] Excepción General: $msg | Class: ${e.javaClass.simpleName}", e)
+            if (msg.contains("reloaded", ignoreCase = true) || msg.contains("UNPLAYABLE", ignoreCase = true)) {
+                return@withContext Result.failure(Exception("YouTube bloqueó la extracción. Actualiza la app/librería."))
+            }
+            return@withContext Result.failure(Exception("Error en NewPipeExtractor: $msg (${e.javaClass.simpleName})"))
         }
-        return Result.failure(Exception("No se pudo obtener el stream de YouTube."))
+
+        return@withContext Result.failure(Exception("No se pudo obtener el video de YouTube. Revisa los logs en Logcat."))
     }
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE INSTAGRAM (Publer API + FastDL V3 + InDown CSRF + VxTagram)
+// EXTRACTOR MODULAR DE INSTAGRAM
 // ============================================================================
 class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
     override val platform = Platform.INSTAGRAM
@@ -606,11 +587,11 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
             Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Intentando Publer API...")
             val request = Request.Builder()
                 .url("https://publer.io/api/v1/media/download")
-                .header("User-Agent", desktopUserAgent)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Origin", "https://publer.io")
-                .header("Referer", "https://publer.io/")
+                .addHeader("User-Agent", desktopUserAgent)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Accept", "application/json")
+                .addHeader("Origin", "https://publer.io")
+                .addHeader("Referer", "https://publer.io/")
                 .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
@@ -625,6 +606,13 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
                             ?: json.getAsJsonArray("payload")?.get(0)?.asJsonObject?.get("path")?.asString ?: ""
 
                         if (path.isNotBlank() && path.startsWith("http")) {
+                            val options = listOf(
+                                DownloadOption("Full HD (1080p)", path, isAudio = false, quality = "1080p", extension = "mp4"),
+                                DownloadOption("HD (720p)", path, isAudio = false, quality = "720p", extension = "mp4"),
+                                DownloadOption("SD (480p)", path, isAudio = false, quality = "480p", extension = "mp4"),
+                                DownloadOption("Audio MP3", path, isAudio = true, quality = "MP3", extension = "mp3")
+                            )
+
                             Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Publer ÉXITO -> $path")
                             return Result.success(
                                 VideoInfo(
@@ -634,9 +622,10 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                     thumbnailUrl = "",
                                     downloadUrl = path,
                                     platform = Platform.INSTAGRAM,
-                                    quality = "HD",
+                                    quality = "1080p Full HD",
                                     isWatermarkFree = true,
-                                    originalUrl = url
+                                    originalUrl = url,
+                                    options = options
                                 )
                             )
                         }
@@ -656,11 +645,11 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
             Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Intentando FastDL V3 API...")
             val request = Request.Builder()
                 .url("https://v3.fastdl.app/api/convert")
-                .header("User-Agent", desktopUserAgent)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Origin", "https://fastdl.app")
-                .header("Referer", "https://fastdl.app/")
+                .addHeader("User-Agent", desktopUserAgent)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Accept", "application/json")
+                .addHeader("Origin", "https://fastdl.app")
+                .addHeader("Referer", "https://fastdl.app/")
                 .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
@@ -674,6 +663,12 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
                         if (urlArray != null && urlArray.size() > 0) {
                             val firstUrl = urlArray.get(0).asJsonObject.get("url")?.asString ?: ""
                             if (firstUrl.isNotBlank() && firstUrl.startsWith("http")) {
+                                val options = listOf(
+                                    DownloadOption("Full HD (1080p)", firstUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                                    DownloadOption("HD (720p)", firstUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                                    DownloadOption("Audio MP3", firstUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                                )
+
                                 Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] FastDL ÉXITO -> $firstUrl")
                                 return Result.success(
                                     VideoInfo(
@@ -683,9 +678,10 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                         thumbnailUrl = "",
                                         downloadUrl = firstUrl,
                                         platform = Platform.INSTAGRAM,
-                                        quality = "HD",
+                                        quality = "1080p Full HD",
                                         isWatermarkFree = true,
-                                        originalUrl = url
+                                        originalUrl = url,
+                                        options = options
                                     )
                                 )
                             }
@@ -702,7 +698,7 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE FACEBOOK (Publer API + MBasic HTML + FDown)
+// EXTRACTOR MODULAR DE FACEBOOK
 // ============================================================================
 class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
     override val platform = Platform.FACEBOOK
@@ -717,7 +713,7 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
         try {
             val request = Request.Builder()
                 .url(rawUrl)
-                .header("User-Agent", desktopUserAgent)
+                .addHeader("User-Agent", desktopUserAgent)
                 .get()
                 .build()
 
@@ -757,11 +753,11 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
             Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Intentando Publer API...")
             val request = Request.Builder()
                 .url("https://publer.io/api/v1/media/download")
-                .header("User-Agent", desktopUserAgent)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Origin", "https://publer.io")
-                .header("Referer", "https://publer.io/")
+                .addHeader("User-Agent", desktopUserAgent)
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Accept", "application/json")
+                .addHeader("Origin", "https://publer.io")
+                .addHeader("Referer", "https://publer.io/")
                 .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
 
@@ -776,6 +772,13 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
                             ?: json.getAsJsonArray("payload")?.get(0)?.asJsonObject?.get("path")?.asString ?: ""
 
                         if (path.isNotBlank() && path.startsWith("http")) {
+                            val options = listOf(
+                                DownloadOption("Full HD (1080p)", path, isAudio = false, quality = "1080p", extension = "mp4"),
+                                DownloadOption("HD (720p)", path, isAudio = false, quality = "720p", extension = "mp4"),
+                                DownloadOption("SD (480p)", path, isAudio = false, quality = "480p", extension = "mp4"),
+                                DownloadOption("Audio MP3", path, isAudio = true, quality = "MP3", extension = "mp3")
+                            )
+
                             Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] Publer ÉXITO -> $path")
                             return Result.success(
                                 VideoInfo(
@@ -785,9 +788,10 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                     thumbnailUrl = "",
                                     downloadUrl = path,
                                     platform = Platform.FACEBOOK,
-                                    quality = "HD",
+                                    quality = "1080p Full HD",
                                     isWatermarkFree = true,
-                                    originalUrl = url
+                                    originalUrl = url,
+                                    options = options
                                 )
                             )
                         }
@@ -807,7 +811,7 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
             Log.d(VideoExtractorRepository.TAG, "[FacebookExtractor] Intentando MBasic: $mbasicUrl")
             val request = Request.Builder()
                 .url(mbasicUrl)
-                .header("User-Agent", mobileUserAgent)
+                .addHeader("User-Agent", mobileUserAgent)
                 .build()
 
             client.newCall(request).execute().use { response ->
@@ -820,6 +824,11 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
                         if (!rawEncodedUrl.isNullOrBlank()) {
                             val decodedUrl = URLDecoder.decode(rawEncodedUrl, "UTF-8").replace("&amp;", "&")
                             if (decodedUrl.startsWith("http")) {
+                                val options = listOf(
+                                    DownloadOption("Video MP4 (HD)", decodedUrl, isAudio = false, quality = "HD", extension = "mp4"),
+                                    DownloadOption("Audio MP3", decodedUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                                )
+
                                 Log.i(VideoExtractorRepository.TAG, "[FacebookExtractor] MBasic ÉXITO -> $decodedUrl")
                                 return Result.success(
                                     VideoInfo(
@@ -831,7 +840,8 @@ class FacebookExtractor(private val client: OkHttpClient) : PlatformExtractor {
                                         platform = Platform.FACEBOOK,
                                         quality = "HD",
                                         isWatermarkFree = true,
-                                        originalUrl = url
+                                        originalUrl = url,
+                                        options = options
                                     )
                                 )
                             }

@@ -10,7 +10,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -21,6 +21,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
+import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.DownloadedItem
 import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
@@ -62,11 +63,30 @@ fun PlatformBadge(platform: Platform) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VideoPreviewCard(
     videoInfo: VideoInfo,
-    onDownloadClick: () -> Unit
+    onDownloadClick: (DownloadOption?) -> Unit
 ) {
+    var selectedOptionIndex by remember(videoInfo) { mutableStateOf(0) }
+    var expanded by remember { mutableStateOf(false) }
+
+    val defaultOptions = remember(videoInfo) {
+        if (videoInfo.options.isNotEmpty()) {
+            videoInfo.options
+        } else {
+            listOf(
+                DownloadOption("Full HD (1080p)", videoInfo.downloadUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                DownloadOption("HD (720p)", videoInfo.downloadUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                DownloadOption("SD (480p)", videoInfo.downloadUrl, isAudio = false, quality = "480p", extension = "mp4"),
+                DownloadOption("Audio MP3", videoInfo.downloadUrl, isAudio = true, quality = "MP3", extension = "mp3")
+            )
+        }
+    }
+
+    val selectedOption = defaultOptions.getOrNull(selectedOptionIndex)
+
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -145,24 +165,88 @@ fun VideoPreviewCard(
                 }
             }
 
+            Text(
+                text = "Selecciona Calidad o Formato:",
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.primary
+            )
+
+            // Selector Desplegable Único (Dropdown Select)
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedTextField(
+                    value = selectedOption?.let { opt ->
+                        if (opt.isAudio) "🎵 ${opt.label}" else "🎥 ${opt.label}"
+                    } ?: "",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Calidad de Video / Audio") },
+                    trailingIcon = {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
+                    },
+                    colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable, true)
+                )
+
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    defaultOptions.forEachIndexed { index, option ->
+                        DropdownMenuItem(
+                            text = {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (option.isAudio) Icons.Default.Audiotrack else Icons.Default.Movie,
+                                        contentDescription = null,
+                                        tint = if (selectedOptionIndex == index) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Text(
+                                        text = option.label,
+                                        fontWeight = if (selectedOptionIndex == index) FontWeight.Bold else FontWeight.Normal,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                            },
+                            onClick = {
+                                selectedOptionIndex = index
+                                expanded = false
+                            },
+                            contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                        )
+                    }
+                }
+            }
+
             Button(
-                onClick = onDownloadClick,
+                onClick = { onDownloadClick(selectedOption) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.primary
+                    containerColor = if (selectedOption?.isAudio == true) Color(0xFF8B5CF6) else MaterialTheme.colorScheme.primary
                 )
             ) {
                 Icon(
-                    imageVector = Icons.Default.Download,
+                    imageVector = if (selectedOption?.isAudio == true) Icons.Default.Audiotrack else Icons.Default.Download,
                     contentDescription = null,
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Descargar Video MP4",
+                    text = if (selectedOption?.isAudio == true) "Descargar Audio MP3" else "Descargar Video (${selectedOption?.quality ?: "HD"})",
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -187,7 +271,7 @@ fun ProgressCard(progress: Int, title: String) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Descargando video...",
+                    text = "Descargando archivo...",
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp
                 )
@@ -244,14 +328,14 @@ fun SuccessCard(
             )
 
             Text(
-                text = "¡Video Guardado en la Galería!",
+                text = "¡Archivo Guardado con ÉXITO!",
                 fontWeight = FontWeight.Bold,
                 fontSize = 18.sp,
                 color = Color(0xFF065F46)
             )
 
             Text(
-                text = "Ubicación: $filePath",
+                text = "Guardado en la Galería ($filePath)",
                 fontSize = 13.sp,
                 color = Color(0xFF047857)
             )
@@ -263,7 +347,7 @@ fun SuccessCard(
             ) {
                 Icon(imageVector = Icons.Default.Add, contentDescription = null)
                 Spacer(modifier = Modifier.width(6.dp))
-                Text(text = "Descargar Otro Video", fontWeight = FontWeight.Bold)
+                Text(text = "Descargar Otro Enlace", fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -285,7 +369,7 @@ fun DownloadHistoryItem(item: DownloadedItem) {
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Icon(
-                imageVector = Icons.Default.Movie,
+                imageVector = if (item.title.contains("MP3")) Icons.Default.Audiotrack else Icons.Default.Movie,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(32.dp)

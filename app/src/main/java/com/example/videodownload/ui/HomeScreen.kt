@@ -207,7 +207,7 @@ fun HomeScreen(
                                         modifier = Modifier.size(48.dp)
                                     )
                                     Text(
-                                        text = "Pega un enlace para descargar en HD sin marcas de agua",
+                                        text = "Pega un enlace para descargar en HD o MP3 sin marcas de agua",
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.outline
                                     )
@@ -237,7 +237,9 @@ fun HomeScreen(
                         is DownloadUiState.InfoLoaded -> {
                             VideoPreviewCard(
                                 videoInfo = state.videoInfo,
-                                onDownloadClick = { viewModel.downloadVideo(state.videoInfo) }
+                                onDownloadClick = { selectedOption ->
+                                    viewModel.downloadMedia(state.videoInfo, selectedOption)
+                                }
                             )
                         }
 

@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.DownloadUiState
 import com.example.videodownload.data.model.DownloadedItem
 import com.example.videodownload.data.model.Platform
@@ -71,7 +72,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch {
-            _uiState.value = DownloadUiState.Loading("Analizando enlace y obteniendo video...")
+            _uiState.value = DownloadUiState.Loading("Analizando enlace y obteniendo calidades disponibles...")
             val result = repository.extractVideoInfo(url)
 
             result.onSuccess { info ->
@@ -84,11 +85,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun downloadVideo(videoInfo: VideoInfo) {
+    fun downloadMedia(videoInfo: VideoInfo, option: DownloadOption? = null) {
         viewModelScope.launch {
             try {
-                _uiState.value = DownloadUiState.Downloading(0, videoInfo.title)
-                val downloadId = downloader.downloadVideo(videoInfo)
+                val label = option?.label ?: videoInfo.quality
+                _uiState.value = DownloadUiState.Downloading(0, "${videoInfo.title} ($label)")
+
+                if (option?.audioDownloadUrl != null && !option.isAudio) {
+                    _uiState.value = DownloadUiState.Downloading(35, "Descargando y combinando audio y video HD...")
+                    downloader.downloadMediaAsync(videoInfo, option)
+                    val path = "Movies/VideoDownload/"
+                    _uiState.value = DownloadUiState.Success(
+                        videoInfo = videoInfo,
+                        filePath = path
+                    )
+
+                    val newItem = DownloadedItem(
+                        id = videoInfo.id,
+                        title = "${videoInfo.title} [${option.label}]",
+                        platform = videoInfo.platform,
+                        localUri = option.downloadUrl
+                    )
+                    _historyList.value = listOf(newItem) + _historyList.value
+                    return@launch
+                }
+
+                val downloadId = downloader.downloadMedia(videoInfo, option)
 
                 var isComplete = false
                 while (!isComplete) {
@@ -98,17 +120,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     when (status) {
                         DownloadManager.STATUS_SUCCESSFUL -> {
                             isComplete = true
+                            val path = if (option?.isAudio == true) "Music/VideoDownload/" else "Movies/VideoDownload/"
                             _uiState.value = DownloadUiState.Success(
                                 videoInfo = videoInfo,
-                                filePath = "Movies/VideoDownload/"
+                                filePath = path
                             )
 
-                            // Agregar al historial de la app
                             val newItem = DownloadedItem(
                                 id = videoInfo.id,
-                                title = videoInfo.title,
+                                title = "${videoInfo.title} [${option?.label ?: "HD"}]",
                                 platform = videoInfo.platform,
-                                localUri = videoInfo.downloadUrl
+                                localUri = option?.downloadUrl ?: videoInfo.downloadUrl
                             )
                             _historyList.value = listOf(newItem) + _historyList.value
                         }
@@ -119,7 +141,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         else -> {
                             _uiState.value = DownloadUiState.Downloading(
                                 progress = if (progress > 0) progress else 25,
-                                title = videoInfo.title
+                                title = "${videoInfo.title} (${option?.label ?: "HD"})"
                             )
                         }
                     }
