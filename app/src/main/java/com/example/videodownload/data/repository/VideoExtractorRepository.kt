@@ -1,11 +1,16 @@
 package com.example.videodownload.data.repository
 
+import android.content.Context
 import android.util.Log
 import com.example.videodownload.data.model.DownloadOption
 import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
+import com.example.videodownload.utils.InstagramCookieManager
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
@@ -19,6 +24,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Response
 import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException
 import org.schabi.newpipe.extractor.exceptions.ParsingException
 import org.schabi.newpipe.extractor.stream.StreamInfo
@@ -43,7 +49,7 @@ interface PlatformExtractor {
     suspend fun extract(url: String): Result<VideoInfo>
 }
 
-class VideoExtractorRepository {
+class VideoExtractorRepository(private val context: Context) {
 
     companion object {
         const val TAG = "VideoExtractor"
@@ -68,8 +74,8 @@ class VideoExtractorRepository {
     private val extractors: List<PlatformExtractor> by lazy {
         listOf(
             TikTokExtractor(client),
-            TwitterExtractor(client),
-            InstagramExtractor(client),
+            TwitterExtractor(client, context),
+            InstagramExtractor(context),
             FacebookExtractor(client),
             YouTubeExtractor(client)
         )
@@ -209,96 +215,455 @@ class TikTokExtractor(private val client: OkHttpClient) : PlatformExtractor {
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE TWITTER / X
+// EXTRACTOR MODULAR DE TWITTER / X (FxTwitter + Syndication + yt-dlp + VxTwitter)
 // ============================================================================
-class TwitterExtractor(private val client: OkHttpClient) : PlatformExtractor {
+class TwitterExtractor(
+    private val client: OkHttpClient,
+    private val context: Context
+) : PlatformExtractor {
     override val platform = Platform.TWITTER
+
+    companion object {
+        private const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36"
+    }
 
     override fun canHandle(url: String): Boolean {
         val lower = url.lowercase()
         return lower.contains("twitter.com") || lower.contains("x.com")
     }
 
-    override suspend fun extract(url: String): Result<VideoInfo> {
-        val statusMatcher = Pattern.compile("status/(\\d+)").matcher(url)
-        val statusId = if (statusMatcher.find()) statusMatcher.group(1) else null
+    private fun extractStatusId(url: String): String? {
+        val statusMatcher = Pattern.compile("status/(\\d+)", Pattern.CASE_INSENSITIVE).matcher(url)
+        return if (statusMatcher.find()) statusMatcher.group(1) else null
+    }
 
-        Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Procesando URL: $url | Status ID: $statusId")
+    private fun normalizeTwitterUrl(rawUrl: String): String {
+        val statusId = extractStatusId(rawUrl)
+        return if (!statusId.isNullOrBlank()) {
+            "https://twitter.com/i/status/$statusId"
+        } else {
+            rawUrl.split("?")[0].replace("x.com", "twitter.com").trim()
+        }
+    }
+
+    override suspend fun extract(url: String): Result<VideoInfo> = withContext(Dispatchers.IO) {
+        val statusId = extractStatusId(url)
+        val normalizedUrl = normalizeTwitterUrl(url)
+
+        Log.d(VideoExtractorRepository.TAG, "==================================================")
+        Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] URL Recibida: '$url'")
+        Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] URL Normalizada: '$normalizedUrl' | Status ID: '$statusId'")
 
         if (statusId.isNullOrBlank()) {
-            return Result.failure(Exception("No se pudo extraer el ID del Tweet de Twitter/X."))
+            return@withContext Result.failure(Exception("No se pudo extraer el ID del Tweet de la URL ingresada."))
         }
 
-        val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        var isTweetFoundNoMedia = false
 
-        // 1. VxTwitter API
-        val vxEndpoints = listOf(
-            "https://api.vxtwitter.com/status/$statusId",
-            "https://api.vxtwitter.com/Twitter/status/$statusId",
-            "https://api.vxtwitter.com/i/status/$statusId"
-        )
+        // --------------------------------------------------------------------
+        // MÉTODOS 1: FxTwitter API (Prioridad Alta - Devuelve JSON completo 200 OK)
+        // --------------------------------------------------------------------
+        try {
+            val fxUrl = "https://api.fxtwitter.com/status/$statusId"
+            Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] MÉTODOS 1 -> FxTwitter API: $fxUrl")
 
-        for (vxUrl in vxEndpoints) {
-            try {
-                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Intentando VxTwitter API: $vxUrl")
-                val request = Request.Builder()
-                    .url(vxUrl)
-                    .addHeader("User-Agent", desktopUserAgent)
-                    .build()
+            val request = Request.Builder()
+                .url(fxUrl)
+                .addHeader("User-Agent", MOBILE_USER_AGENT)
+                .addHeader("Accept", "application/json")
+                .get()
+                .build()
 
-                client.newCall(request).execute().use { response ->
-                    Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] VxTwitter HTTP Code: ${response.code}")
-                    if (response.isSuccessful) {
-                        val body = response.body?.string() ?: ""
-                        if (body.isNotBlank() && body.startsWith("{")) {
-                            val json = JsonParser.parseString(body).asJsonObject
-                            val text = json.get("text")?.asString?.takeIf { it.isNotBlank() } ?: "Twitter / X Video"
-                            val userName = json.get("user_name")?.asString
-                                ?: json.get("user_screen_name")?.asString
-                                ?: "Twitter User"
+            client.newCall(request).execute().use { response ->
+                val responseCode = response.code
+                val bodyString = response.body?.string() ?: ""
 
-                            val mediaExtended = json.getAsJsonArray("media_extended")
-                            if (mediaExtended != null && mediaExtended.size() > 0) {
-                                for (i in 0 until mediaExtended.size()) {
-                                    val media = mediaExtended.get(i).asJsonObject
-                                    val type = media.get("type")?.asString ?: ""
-                                    val videoUrl = media.get("url")?.asString ?: ""
-                                    val thumb = media.get("thumbnail_url")?.asString ?: ""
+                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter HTTP Code: $responseCode")
 
-                                    if (videoUrl.isNotBlank() && (type == "video" || type == "gif" || videoUrl.contains(".mp4"))) {
-                                        val options = listOf(
-                                            DownloadOption("Full HD (1080p)", videoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
-                                            DownloadOption("HD (720p)", videoUrl, isAudio = false, quality = "720p", extension = "mp4"),
-                                            DownloadOption("Audio MP3", videoUrl, isAudio = true, quality = "MP3", extension = "mp3")
-                                        )
+                if (response.isSuccessful && bodyString.startsWith("{")) {
+                    val json = JsonParser.parseString(bodyString).asJsonObject
+                    if (json.has("tweet")) {
+                        val tweetObj = json.getAsJsonObject("tweet")
+                        val text = tweetObj.get("text")?.asString?.takeIf { it.isNotBlank() } ?: "Twitter / X Video"
+                        val authorObj = if (tweetObj.has("author")) tweetObj.getAsJsonObject("author") else null
+                        val authorName = authorObj?.get("name")?.asString ?: authorObj?.get("screen_name")?.asString ?: "Twitter User"
 
-                                        Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] VxTwitter ÉXITO -> $videoUrl")
-                                        return Result.success(
-                                            VideoInfo(
-                                                id = statusId,
-                                                title = text,
-                                                author = userName,
-                                                thumbnailUrl = thumb,
-                                                downloadUrl = videoUrl,
-                                                platform = Platform.TWITTER,
-                                                quality = "1080p Full HD",
-                                                isWatermarkFree = true,
-                                                originalUrl = url,
-                                                options = options
+                        val mediaObj = if (tweetObj.has("media")) tweetObj.getAsJsonObject("media") else null
+                        val quoteMediaObj = if (tweetObj.has("quote") && tweetObj.getAsJsonObject("quote").has("media")) {
+                            tweetObj.getAsJsonObject("quote").getAsJsonObject("media")
+                        } else null
+
+                        Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter JSON Completo 'tweet.media': $mediaObj")
+
+                        // Extracción de miniatura de alta calidad en FxTwitter
+                        var fxThumbnail = ""
+                        if (mediaObj != null) {
+                            if (mediaObj.has("videos") && mediaObj.getAsJsonArray("videos").size() > 0) {
+                                val v0 = mediaObj.getAsJsonArray("videos").get(0).asJsonObject
+                                fxThumbnail = v0.get("thumbnail_url")?.asString
+                                    ?: v0.get("poster")?.asString ?: ""
+                            }
+                            if (fxThumbnail.isBlank() && mediaObj.has("photos") && mediaObj.getAsJsonArray("photos").size() > 0) {
+                                fxThumbnail = mediaObj.getAsJsonArray("photos").get(0).asJsonObject.get("url")?.asString ?: ""
+                            }
+                        }
+                        if (fxThumbnail.isBlank() && quoteMediaObj != null) {
+                            if (quoteMediaObj.has("videos") && quoteMediaObj.getAsJsonArray("videos").size() > 0) {
+                                val v0 = quoteMediaObj.getAsJsonArray("videos").get(0).asJsonObject
+                                fxThumbnail = v0.get("thumbnail_url")?.asString ?: ""
+                            }
+                        }
+
+                        val optionsList = mutableListOf<DownloadOption>()
+
+                        fun parseMediaObject(mObj: JsonObject?) {
+                            if (mObj == null) return
+                            if (mObj.has("videos")) {
+                                val videos = mObj.getAsJsonArray("videos")
+                                if (videos != null && videos.size() > 0) {
+                                    for (i in 0 until videos.size()) {
+                                        val vid = videos.get(i).asJsonObject
+                                        val vUrl = vid.get("url")?.asString ?: ""
+                                        val height = if (vid.has("height") && !vid.get("height").isJsonNull) vid.get("height").asInt else 0
+                                        if (vUrl.isNotBlank() && vUrl.startsWith("http")) {
+                                            val label = if (height > 0) "${height}p" else "HD"
+                                            if (optionsList.none { it.quality == label }) {
+                                                optionsList.add(
+                                                    DownloadOption("Video $label", vUrl, isAudio = false, quality = label, extension = "mp4")
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (optionsList.isEmpty() && mObj.has("all")) {
+                                val allMedia = mObj.getAsJsonArray("all")
+                                if (allMedia != null && allMedia.size() > 0) {
+                                    for (i in 0 until allMedia.size()) {
+                                        val item = allMedia.get(i).asJsonObject
+                                        val type = item.get("type")?.asString ?: ""
+                                        val itemUrl = item.get("url")?.asString ?: ""
+                                        if (itemUrl.isNotBlank() && (type == "video" || type == "gif" || itemUrl.contains(".mp4"))) {
+                                            optionsList.add(
+                                                DownloadOption("Video MP4", itemUrl, isAudio = false, quality = "HD", extension = "mp4")
                                             )
-                                        )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        parseMediaObject(mediaObj)
+                        parseMediaObject(quoteMediaObj)
+
+                        if (optionsList.isNotEmpty()) {
+                            val bestUrl = optionsList[0].downloadUrl
+                            optionsList.add(DownloadOption("Audio MP3", bestUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+
+                            Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter ÉXITO -> $bestUrl (Thumb: $fxThumbnail)")
+                            return@withContext Result.success(
+                                VideoInfo(
+                                    id = statusId,
+                                    title = text,
+                                    author = authorName,
+                                    thumbnailUrl = fxThumbnail,
+                                    downloadUrl = bestUrl,
+                                    platform = Platform.TWITTER,
+                                    quality = optionsList[0].quality,
+                                    isWatermarkFree = true,
+                                    originalUrl = url,
+                                    options = optionsList
+                                )
+                            )
+                        } else {
+                            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] FxTwitter respondió 200 OK pero el JSON no contiene ninguna pista de video.")
+                            isTweetFoundNoMedia = true
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción FxTwitter API: ${e.message}")
+        }
+
+        // --------------------------------------------------------------------
+        // MÉTODOS 2: Twitter Official Syndication API (`cdn.syndication.twimg.com`)
+        // --------------------------------------------------------------------
+        try {
+            val syndicationUrl = "https://cdn.syndication.twimg.com/tweet-result?id=$statusId&token=x"
+            Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] MÉTODOS 2 -> Twitter Syndication API: $syndicationUrl")
+
+            val request = Request.Builder()
+                .url(syndicationUrl)
+                .addHeader("User-Agent", MOBILE_USER_AGENT)
+                .addHeader("Accept", "application/json")
+                .get()
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val responseCode = response.code
+                val bodyString = response.body?.string() ?: ""
+
+                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] Syndication API HTTP Code: $responseCode")
+
+                if (response.isSuccessful && bodyString.startsWith("{")) {
+                    val json = JsonParser.parseString(bodyString).asJsonObject
+                    val text = json.get("text")?.asString?.takeIf { it.isNotBlank() } ?: "Twitter / X Video"
+                    val userObj = if (json.has("user")) json.getAsJsonObject("user") else null
+                    val authorName = userObj?.get("name")?.asString ?: userObj?.get("screen_name")?.asString ?: "Twitter User"
+
+                    var syndicationThumbnail = ""
+                    if (json.has("mediaDetails")) {
+                        val mediaArr = json.getAsJsonArray("mediaDetails")
+                        if (mediaArr != null && mediaArr.size() > 0) {
+                            syndicationThumbnail = mediaArr.get(0).asJsonObject.get("media_url_https")?.asString ?: ""
+                        }
+                    }
+
+                    val optionsList = mutableListOf<DownloadOption>()
+
+                    fun parseSyndicationMedia(mediaArr: JsonArray?) {
+                        if (mediaArr == null) return
+                        for (i in 0 until mediaArr.size()) {
+                            val media = mediaArr.get(i).asJsonObject
+                            val type = media.get("type")?.asString ?: ""
+                            if ((type == "video" || type == "animated_gif") && media.has("video_info")) {
+                                val videoInfoObj = media.getAsJsonObject("video_info")
+                                if (videoInfoObj.has("variants")) {
+                                    val variants = videoInfoObj.getAsJsonArray("variants")
+                                    val mp4Variants = mutableListOf<JsonObject>()
+
+                                    for (j in 0 until variants.size()) {
+                                        val varObj = variants.get(j).asJsonObject
+                                        val contentType = varObj.get("content_type")?.asString ?: ""
+                                        if (contentType == "video/mp4" && varObj.has("url")) {
+                                            mp4Variants.add(varObj)
+                                        }
+                                    }
+
+                                    mp4Variants.sortByDescending {
+                                        if (it.has("bitrate") && !it.get("bitrate").isJsonNull) it.get("bitrate").asLong else 0L
+                                    }
+
+                                    for (vObj in mp4Variants) {
+                                        val vUrl = vObj.get("url")?.asString ?: ""
+                                        val bitrate = if (vObj.has("bitrate") && !vObj.get("bitrate").isJsonNull) vObj.get("bitrate").asLong else 0L
+                                        val qualityLabel = when {
+                                            bitrate > 2000000 -> "1080p Full HD"
+                                            bitrate > 800000 -> "720p HD"
+                                            bitrate > 300000 -> "480p SD"
+                                            else -> "SD"
+                                        }
+                                        if (vUrl.isNotBlank() && optionsList.none { it.quality == qualityLabel }) {
+                                            optionsList.add(
+                                                DownloadOption(qualityLabel, vUrl, isAudio = false, quality = qualityLabel, extension = "mp4")
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    if (json.has("mediaDetails")) {
+                        parseSyndicationMedia(json.getAsJsonArray("mediaDetails"))
+                    }
+                    if (json.has("quoted_tweet") && json.getAsJsonObject("quoted_tweet").has("mediaDetails")) {
+                        parseSyndicationMedia(json.getAsJsonObject("quoted_tweet").getAsJsonArray("mediaDetails"))
+                    }
+
+                    if (optionsList.isNotEmpty()) {
+                        val bestUrl = optionsList[0].downloadUrl
+                        optionsList.add(DownloadOption("Audio MP3", bestUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+
+                        Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] Syndication API ÉXITO -> $bestUrl (Thumb: $syndicationThumbnail)")
+                        return@withContext Result.success(
+                            VideoInfo(
+                                id = statusId,
+                                title = text,
+                                author = authorName,
+                                thumbnailUrl = syndicationThumbnail,
+                                downloadUrl = bestUrl,
+                                platform = Platform.TWITTER,
+                                quality = optionsList[0].quality,
+                                isWatermarkFree = true,
+                                originalUrl = url,
+                                options = optionsList
+                            )
+                        )
+                    } else {
+                        Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Syndication API respondió 200 OK pero sin objetos de video_info.")
+                        isTweetFoundNoMedia = true
+                    }
                 }
-            } catch (e: Exception) {
-                Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción en VxTwitter: ${e.message}")
             }
+        } catch (e: Exception) {
+            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción Syndication API: ${e.message}")
         }
 
-        return Result.failure(Exception("No se pudo obtener el video de Twitter/X."))
+        // --------------------------------------------------------------------
+        // MÉTODOS 3: Native Local yt-dlp Executable Engine
+        // --------------------------------------------------------------------
+        try {
+            Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] MÉTODOS 3 -> Native yt-dlp para '$normalizedUrl'...")
+            val request = YoutubeDLRequest(normalizedUrl)
+            request.addOption("--dump-json")
+            request.addOption("--no-playlist")
+            request.addOption("--user-agent", MOBILE_USER_AGENT)
+
+            val response = YoutubeDL.getInstance().execute(request)
+            val outJson = response.out ?: ""
+
+            if (outJson.isNotBlank() && outJson.startsWith("{")) {
+                val json = JsonParser.parseString(outJson).asJsonObject
+
+                var mainUrl = json.get("url")?.asString ?: ""
+                val title = json.get("title")?.asString?.takeIf { it.isNotBlank() }
+                    ?: json.get("description")?.asString?.takeIf { it.isNotBlank() }
+                    ?: "Twitter / X Video"
+                val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "Twitter User"
+                val thumb = json.get("thumbnail")?.asString ?: ""
+
+                val optionsList = mutableListOf<DownloadOption>()
+
+                if (json.has("formats")) {
+                    val formats = json.getAsJsonArray("formats")
+                    if (formats != null && formats.size() > 0) {
+                        for (i in 0 until formats.size()) {
+                            val fmt = formats.get(i).asJsonObject
+                            val fmtUrl = fmt.get("url")?.asString ?: ""
+                            val ext = fmt.get("ext")?.asString ?: "mp4"
+                            val height = if (fmt.has("height") && !fmt.get("height").isJsonNull) fmt.get("height").asInt else 0
+
+                            if (fmtUrl.isNotBlank() && (fmtUrl.contains("twimg.com") || fmtUrl.contains(".mp4"))) {
+                                val qualityLabel = if (height > 0) "${height}p" else "HD"
+                                if (optionsList.none { it.quality == qualityLabel }) {
+                                    optionsList.add(
+                                        DownloadOption(
+                                            label = "Video $qualityLabel",
+                                            downloadUrl = fmtUrl,
+                                            isAudio = false,
+                                            quality = qualityLabel,
+                                            extension = ext
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (mainUrl.isBlank() && optionsList.isNotEmpty()) {
+                    mainUrl = optionsList[0].downloadUrl
+                }
+
+                if (optionsList.isEmpty() && mainUrl.isNotBlank()) {
+                    optionsList.add(DownloadOption("Full HD (1080p)", mainUrl, isAudio = false, quality = "1080p", extension = "mp4"))
+                }
+
+                if (mainUrl.isNotBlank()) {
+                    optionsList.add(DownloadOption("Audio MP3", mainUrl, isAudio = true, quality = "MP3", extension = "mp3"))
+                }
+
+                if (mainUrl.isNotBlank() && mainUrl.startsWith("http")) {
+                    Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] Native yt-dlp ÉXITO -> $mainUrl (Thumb: $thumb)")
+                    return@withContext Result.success(
+                        VideoInfo(
+                            id = statusId,
+                            title = title,
+                            author = author,
+                            thumbnailUrl = thumb,
+                            downloadUrl = mainUrl,
+                            platform = Platform.TWITTER,
+                            quality = optionsList.firstOrNull()?.quality ?: "HD",
+                            isWatermarkFree = true,
+                            originalUrl = url,
+                            options = optionsList
+                        )
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción Native yt-dlp: ${e.message}")
+        }
+
+        // --------------------------------------------------------------------
+        // MÉTODOS 4: VxTwitter API
+        // --------------------------------------------------------------------
+        try {
+            val vxUrl = "https://api.vxtwitter.com/status/$statusId"
+            Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] MÉTODOS 4 -> VxTwitter API: $vxUrl")
+
+            val request = Request.Builder()
+                .url(vxUrl)
+                .addHeader("User-Agent", MOBILE_USER_AGENT)
+                .addHeader("Accept", "application/json")
+                .get()
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val responseCode = response.code
+                val bodyString = response.body?.string() ?: ""
+
+                Log.d(VideoExtractorRepository.TAG, "[TwitterExtractor] VxTwitter HTTP Code: $responseCode")
+
+                if (response.isSuccessful && bodyString.startsWith("{")) {
+                    val json = JsonParser.parseString(bodyString).asJsonObject
+                    val text = json.get("text")?.asString?.takeIf { it.isNotBlank() } ?: "Twitter / X Video"
+                    val userName = json.get("user_name")?.asString ?: json.get("user_screen_name")?.asString ?: "Twitter User"
+
+                    var mediaUrl: String? = null
+                    var vxThumbnail = ""
+                    val mediaExtended = json.getAsJsonArray("media_extended")
+                    if (mediaExtended != null && mediaExtended.size() > 0) {
+                        for (i in 0 until mediaExtended.size()) {
+                            val media = mediaExtended.get(i).asJsonObject
+                            val mUrl = media.get("url")?.asString ?: ""
+                            val mType = media.get("type")?.asString ?: ""
+                            if (mUrl.isNotBlank() && (mType == "video" || mType == "gif" || mUrl.contains(".mp4"))) {
+                                mediaUrl = mUrl
+                                vxThumbnail = media.get("thumbnail_url")?.asString ?: ""
+                                break
+                            }
+                        }
+                    }
+
+                    if (!mediaUrl.isNullOrBlank() && mediaUrl.startsWith("http")) {
+                        val options = listOf(
+                            DownloadOption("Full HD (1080p)", mediaUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                            DownloadOption("HD (720p)", mediaUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                            DownloadOption("Audio MP3", mediaUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                        )
+
+                        Log.i(VideoExtractorRepository.TAG, "[TwitterExtractor] VxTwitter ÉXITO -> $mediaUrl (Thumb: $vxThumbnail)")
+                        return@withContext Result.success(
+                            VideoInfo(
+                                id = statusId,
+                                title = text,
+                                author = userName,
+                                thumbnailUrl = vxThumbnail,
+                                downloadUrl = mediaUrl,
+                                platform = Platform.TWITTER,
+                                quality = "1080p Full HD",
+                                isWatermarkFree = true,
+                                originalUrl = url,
+                                options = options
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(VideoExtractorRepository.TAG, "[TwitterExtractor] Excepción VxTwitter API: ${e.message}")
+        }
+
+        val finalErrorMsg = if (isTweetFoundNoMedia) {
+            "El Tweet no contiene ningún video o GIF para descargar."
+        } else {
+            "No se pudo extraer el video de Twitter / X. Verifica que la publicación sea pública y contenga un video."
+        }
+
+        return@withContext Result.failure(Exception(finalErrorMsg))
     }
 }
 
@@ -309,7 +674,7 @@ class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
 
     private val cookieMap = ConcurrentHashMap<String, String>()
 
-    override fun execute(request: org.schabi.newpipe.extractor.downloader.Request): org.schabi.newpipe.extractor.downloader.Response {
+    override fun execute(request: org.schabi.newpipe.extractor.downloader.Request): Response {
         val httpMethod = request.httpMethod()
         val url = request.url()
         val headers = request.headers()
@@ -360,7 +725,7 @@ class NewPipeOkHttpDownloader(private val client: OkHttpClient) : Downloader() {
 
             Log.d(VideoExtractorRepository.TAG, "[NewPipeDownloader] HTTP $responseCode | URL: $url | Body (200 chars): ${responseBody.take(200)}")
 
-            return org.schabi.newpipe.extractor.downloader.Response(responseCode, responseMessage, responseHeaders, responseBody, url)
+            return Response(responseCode, responseMessage, responseHeaders, responseBody, url)
         }
     }
 }
@@ -542,10 +907,14 @@ class YouTubeExtractor(private val client: OkHttpClient) : PlatformExtractor {
 }
 
 // ============================================================================
-// EXTRACTOR MODULAR DE INSTAGRAM
+// EXTRACTOR MODULAR DE INSTAGRAM (100% Local Ejecutable Nativo con youtubedl-android)
 // ============================================================================
-class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
+class InstagramExtractor(private val context: Context) : PlatformExtractor {
     override val platform = Platform.INSTAGRAM
+
+    companion object {
+        private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.119 Mobile Safari/537.36"
+    }
 
     override fun canHandle(url: String): Boolean {
         val lower = url.lowercase()
@@ -569,131 +938,111 @@ class InstagramExtractor(private val client: OkHttpClient) : PlatformExtractor {
         return null
     }
 
-    override suspend fun extract(url: String): Result<VideoInfo> {
+    override suspend fun extract(url: String): Result<VideoInfo> = withContext(Dispatchers.IO) {
         val cleanUrl = url.split("?")[0].trim()
         val shortcode = extractShortcode(cleanUrl)
         val canonicalUrl = if (!shortcode.isNullOrBlank()) "https://www.instagram.com/reel/$shortcode/" else cleanUrl
 
-        Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] URL: '$url' | Canónica: '$canonicalUrl' | Shortcode: '$shortcode'")
+        Log.d(VideoExtractorRepository.TAG, "==================================================")
+        Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Ejecutando Local Native yt-dlp Executable Engine...")
+        Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] URL: '$canonicalUrl' | Shortcode: '$shortcode'")
 
-        val desktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        var isRetryAfterUpdate = false
+        while (true) {
+            try {
+                val request = YoutubeDLRequest(canonicalUrl)
+                request.addOption("--dump-json")
+                request.addOption("--no-playlist")
+                request.addOption("--user-agent", USER_AGENT)
 
-        // 1. Publer Media API
-        try {
-            val jsonPayload = JsonObject().apply {
-                addProperty("url", canonicalUrl)
-            }.toString()
+                // Cargar cookies privadas del almacenamiento interno si el usuario inició sesión
+                val cookieFile = InstagramCookieManager.getCookieFile(context)
+                if (InstagramCookieManager.hasCookies(context)) {
+                    Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Cargando cookies de Instagram desde almacenamiento privado: ${cookieFile.absolutePath}")
+                    request.addOption("--cookies", cookieFile.absolutePath)
+                } else {
+                    Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] No hay cookies privadas guardadas. Ejecutando extracción anónima.")
+                }
 
-            Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Intentando Publer API...")
-            val request = Request.Builder()
-                .url("https://publer.io/api/v1/media/download")
-                .addHeader("User-Agent", desktopUserAgent)
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Accept", "application/json")
-                .addHeader("Origin", "https://publer.io")
-                .addHeader("Referer", "https://publer.io/")
-                .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
+                Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Ejecutando YoutubeDL.getInstance().execute()...")
+                val response = YoutubeDL.getInstance().execute(request)
+                val outJson = response.out ?: ""
 
-            client.newCall(request).execute().use { response ->
-                Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Publer HTTP Code: ${response.code}")
-                if (response.isSuccessful) {
-                    val bodyString = response.body?.string() ?: ""
-                    if (bodyString.isNotBlank() && bodyString.startsWith("{")) {
-                        val json = JsonParser.parseString(bodyString).asJsonObject
-                        val path = json.get("path")?.asString
-                            ?: json.get("url")?.asString
-                            ?: json.getAsJsonArray("payload")?.get(0)?.asJsonObject?.get("path")?.asString ?: ""
+                if (outJson.isNotBlank() && outJson.startsWith("{")) {
+                    val json = JsonParser.parseString(outJson).asJsonObject
 
-                        if (path.isNotBlank() && path.startsWith("http")) {
-                            val options = listOf(
-                                DownloadOption("Full HD (1080p)", path, isAudio = false, quality = "1080p", extension = "mp4"),
-                                DownloadOption("HD (720p)", path, isAudio = false, quality = "720p", extension = "mp4"),
-                                DownloadOption("SD (480p)", path, isAudio = false, quality = "480p", extension = "mp4"),
-                                DownloadOption("Audio MP3", path, isAudio = true, quality = "MP3", extension = "mp3")
-                            )
-
-                            Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Publer ÉXITO -> $path")
-                            return Result.success(
-                                VideoInfo(
-                                    id = shortcode ?: System.currentTimeMillis().toString(),
-                                    title = "Instagram Reel",
-                                    author = "Instagram User",
-                                    thumbnailUrl = "",
-                                    downloadUrl = path,
-                                    platform = Platform.INSTAGRAM,
-                                    quality = "1080p Full HD",
-                                    isWatermarkFree = true,
-                                    originalUrl = url,
-                                    options = options
-                                )
-                            )
+                    var directVideoUrl = json.get("url")?.asString ?: ""
+                    if (directVideoUrl.isBlank() && json.has("requested_formats")) {
+                        val formats = json.getAsJsonArray("requested_formats")
+                        if (formats != null && formats.size() > 0) {
+                            directVideoUrl = formats.get(0).asJsonObject.get("url")?.asString ?: ""
                         }
                     }
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción Publer: ${e.message}")
-        }
 
-        // 2. FastDL V3 API
-        try {
-            val jsonPayload = JsonObject().apply {
-                addProperty("url", canonicalUrl)
-            }.toString()
+                    val title = json.get("title")?.asString?.takeIf { it.isNotBlank() } ?: "Instagram Reel"
+                    val author = json.get("uploader")?.asString ?: json.get("uploader_id")?.asString ?: "Instagram User"
+                    val thumb = json.get("thumbnail")?.asString ?: ""
 
-            Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] Intentando FastDL V3 API...")
-            val request = Request.Builder()
-                .url("https://v3.fastdl.app/api/convert")
-                .addHeader("User-Agent", desktopUserAgent)
-                .addHeader("Content-Type", "application/json")
-                .addHeader("Accept", "application/json")
-                .addHeader("Origin", "https://fastdl.app")
-                .addHeader("Referer", "https://fastdl.app/")
-                .post(jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
+                    if (directVideoUrl.isNotBlank() && directVideoUrl.startsWith("http")) {
+                        val options = listOf(
+                            DownloadOption("Full HD (1080p)", directVideoUrl, isAudio = false, quality = "1080p", extension = "mp4"),
+                            DownloadOption("HD (720p)", directVideoUrl, isAudio = false, quality = "720p", extension = "mp4"),
+                            DownloadOption("Audio MP3", directVideoUrl, isAudio = true, quality = "MP3", extension = "mp3")
+                        )
 
-            client.newCall(request).execute().use { response ->
-                Log.d(VideoExtractorRepository.TAG, "[InstagramExtractor] FastDL HTTP Code: ${response.code}")
-                if (response.isSuccessful) {
-                    val bodyString = response.body?.string() ?: ""
-                    if (bodyString.isNotBlank() && bodyString.startsWith("{")) {
-                        val json = JsonParser.parseString(bodyString).asJsonObject
-                        val urlArray = json.getAsJsonArray("url")
-                        if (urlArray != null && urlArray.size() > 0) {
-                            val firstUrl = urlArray.get(0).asJsonObject.get("url")?.asString ?: ""
-                            if (firstUrl.isNotBlank() && firstUrl.startsWith("http")) {
-                                val options = listOf(
-                                    DownloadOption("Full HD (1080p)", firstUrl, isAudio = false, quality = "1080p", extension = "mp4"),
-                                    DownloadOption("HD (720p)", firstUrl, isAudio = false, quality = "720p", extension = "mp4"),
-                                    DownloadOption("Audio MP3", firstUrl, isAudio = true, quality = "MP3", extension = "mp3")
-                                )
-
-                                Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] FastDL ÉXITO -> $firstUrl")
-                                return Result.success(
-                                    VideoInfo(
-                                        id = shortcode ?: System.currentTimeMillis().toString(),
-                                        title = "Instagram Reel",
-                                        author = "Instagram User",
-                                        thumbnailUrl = "",
-                                        downloadUrl = firstUrl,
-                                        platform = Platform.INSTAGRAM,
-                                        quality = "1080p Full HD",
-                                        isWatermarkFree = true,
-                                        originalUrl = url,
-                                        options = options
-                                    )
-                                )
-                            }
-                        }
+                        Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] Native yt-dlp ÉXITO -> $directVideoUrl")
+                        return@withContext Result.success(
+                            VideoInfo(
+                                id = shortcode ?: System.currentTimeMillis().toString(),
+                                title = title,
+                                author = author,
+                                thumbnailUrl = thumb,
+                                downloadUrl = directVideoUrl,
+                                platform = Platform.INSTAGRAM,
+                                quality = "1080p Full HD",
+                                isWatermarkFree = true,
+                                originalUrl = url,
+                                options = options
+                            )
+                        )
                     }
                 }
+            } catch (e: Exception) {
+                val errorMsg = e.message ?: ""
+                Log.e(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción Native yt-dlp: $errorMsg", e)
+
+                // Si no hemos intentado actualizar yt-dlp y es un error de extractor/firma
+                if (!isRetryAfterUpdate && (errorMsg.contains("ExtractorError") || errorMsg.contains("signature") || errorMsg.contains("update") || errorMsg.contains("HTTP Error"))) {
+                    isRetryAfterUpdate = true
+                    try {
+                        Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Fallo de extractor. Intentando actualización automática de yt-dlp (YoutubeDL.updateYoutubeDL)...")
+                        YoutubeDL.getInstance().updateYoutubeDL(context)
+                        Log.i(VideoExtractorRepository.TAG, "[InstagramExtractor] yt-dlp actualizado con éxito. Reintentando extracción...")
+                        continue
+                    } catch (updateEx: Exception) {
+                        Log.e(VideoExtractorRepository.TAG, "[InstagramExtractor] Error actualizando yt-dlp: ${updateEx.message}")
+                    }
+                }
+
+                // Mapeo concreto de errores
+                val userError = when {
+                    errorMsg.contains("Private", ignoreCase = true) || errorMsg.contains("login", ignoreCase = true) ->
+                        "El Reel o publicación de Instagram es privado o requiere inicio de sesión."
+                    errorMsg.contains("404", ignoreCase = true) || errorMsg.contains("not found", ignoreCase = true) ->
+                        "El Reel de Instagram fue eliminado o el enlace no es válido."
+                    errorMsg.contains("429", ignoreCase = true) || errorMsg.contains("rate limit", ignoreCase = true) ->
+                        "Límite de peticiones excedido en Instagram."
+                    else ->
+                        "Error de extracción en Instagram: ${e.localizedMessage}"
+                }
+
+                return@withContext Result.failure(Exception(userError))
             }
-        } catch (e: Exception) {
-            Log.w(VideoExtractorRepository.TAG, "[InstagramExtractor] Excepción FastDL: ${e.message}")
+
+            break
         }
 
-        return Result.failure(Exception("No se pudo extraer el video de Instagram."))
+        return@withContext Result.failure(Exception("No se pudo extraer el Reel de Instagram."))
     }
 }
 

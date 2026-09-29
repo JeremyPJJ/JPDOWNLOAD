@@ -21,7 +21,7 @@ import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val repository = VideoExtractorRepository()
+    private val repository = VideoExtractorRepository(application)
     private val downloader = AndroidVideoDownloader(application)
 
     private val _urlInput = MutableStateFlow("")
@@ -89,11 +89,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val label = option?.label ?: videoInfo.quality
-                _uiState.value = DownloadUiState.Downloading(0, "${videoInfo.title} ($label)")
+                _uiState.value = DownloadUiState.Downloading(2, "Iniciando descarga...")
 
                 if (option?.audioDownloadUrl != null && !option.isAudio) {
-                    _uiState.value = DownloadUiState.Downloading(35, "Descargando y combinando audio y video HD...")
-                    downloader.downloadMediaAsync(videoInfo, option)
+                    downloader.downloadMediaAsync(videoInfo, option) { progressPercent, statusMsg ->
+                        _uiState.value = DownloadUiState.Downloading(
+                            progress = progressPercent,
+                            title = statusMsg
+                        )
+                    }
+
                     val path = "Movies/VideoDownload/"
                     _uiState.value = DownloadUiState.Success(
                         videoInfo = videoInfo,
@@ -114,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 var isComplete = false
                 while (!isComplete) {
-                    delay(800)
+                    delay(500)
                     val (status, progress) = downloader.getDownloadStatus(downloadId)
 
                     when (status) {
@@ -139,9 +144,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             _uiState.value = DownloadUiState.Error("La descarga falló. Intenta de nuevo.")
                         }
                         else -> {
+                            val currentProgress = if (progress in 1..99) progress else 15
                             _uiState.value = DownloadUiState.Downloading(
-                                progress = if (progress > 0) progress else 25,
-                                title = "${videoInfo.title} (${option?.label ?: "HD"})"
+                                progress = currentProgress,
+                                title = "Descargando ${videoInfo.title} (${option?.label ?: "HD"})..."
                             )
                         }
                     }

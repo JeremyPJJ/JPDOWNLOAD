@@ -1,7 +1,6 @@
 package com.example.videodownload.ui
 
-import androidx.compose.animation.*
-import androidx.compose.foundation.Image
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -16,20 +15,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.videodownload.R
 import com.example.videodownload.data.model.DownloadUiState
 import com.example.videodownload.data.model.Platform
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(
-    viewModel: MainViewModel
-) {
+fun HomeScreen(viewModel: MainViewModel) {
     val urlInput by viewModel.urlInput.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
     val detectedPlatform by viewModel.detectedPlatform.collectAsState()
@@ -41,50 +35,50 @@ fun HomeScreen(
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF1E293B)),
-                            contentAlignment = Alignment.Center
+                        Surface(
+                            modifier = Modifier.size(32.dp),
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary
                         ) {
-                            Image(
-                                painter = painterResource(id = R.mipmap.ic_jpdown_foreground),
-                                contentDescription = "Logo JPDOWNLOAD",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Fit
-                            )
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Download,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
                         Text(
                             text = "JPDOWNLOAD",
                             fontWeight = FontWeight.ExtraBold,
-                            fontSize = 20.sp
+                            fontSize = 20.sp,
+                            letterSpacing = 1.sp
                         )
                     }
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface
+                    containerColor = MaterialTheme.colorScheme.background
                 )
             )
         }
-    ) { innerPadding ->
+    ) { paddingValues ->
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
+                .padding(paddingValues)
                 .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
-            contentPadding = PaddingValues(bottom = 24.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
-                // Selector / Banner de Plataformas Soportadas
+                // Banner superior informativo
                 Card(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
+                    shape = RoundedCornerShape(18.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) {
                     Column(
@@ -182,14 +176,23 @@ fun HomeScreen(
                 }
             }
 
-            // Seccion de Estados (Loading, Loaded, Downloading, Success, Error)
+            // Seccion de Estados (Loading, Loaded, Downloading, Success, Error) sin parpadeos
             item {
+                val stateKey = when (uiState) {
+                    is DownloadUiState.Idle -> "Idle"
+                    is DownloadUiState.Loading -> "Loading"
+                    is DownloadUiState.InfoLoaded -> "InfoLoaded"
+                    is DownloadUiState.Downloading -> "Downloading"
+                    is DownloadUiState.Success -> "Success"
+                    is DownloadUiState.Error -> "Error"
+                }
+
                 AnimatedContent(
-                    targetState = uiState,
+                    targetState = stateKey,
                     label = "UI State Transition"
-                ) { state ->
-                    when (state) {
-                        is DownloadUiState.Idle -> {
+                ) { key ->
+                    when (key) {
+                        "Idle" -> {
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -215,7 +218,8 @@ fun HomeScreen(
                             }
                         }
 
-                        is DownloadUiState.Loading -> {
+                        "Loading" -> {
+                            val loadingMsg = (uiState as? DownloadUiState.Loading)?.message ?: "Analizando enlace..."
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(16.dp)
@@ -227,35 +231,46 @@ fun HomeScreen(
                                 ) {
                                     CircularProgressIndicator(modifier = Modifier.size(32.dp))
                                     Text(
-                                        text = state.message,
+                                        text = loadingMsg,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 }
                             }
                         }
 
-                        is DownloadUiState.InfoLoaded -> {
-                            VideoPreviewCard(
-                                videoInfo = state.videoInfo,
-                                onDownloadClick = { selectedOption ->
-                                    viewModel.downloadMedia(state.videoInfo, selectedOption)
-                                }
+                        "InfoLoaded" -> {
+                            val loadedInfo = (uiState as? DownloadUiState.InfoLoaded)?.videoInfo
+                            if (loadedInfo != null) {
+                                VideoPreviewCard(
+                                    videoInfo = loadedInfo,
+                                    onDownloadClick = { selectedOption ->
+                                        viewModel.downloadMedia(loadedInfo, selectedOption)
+                                    }
+                                )
+                            }
+                        }
+
+                        "Downloading" -> {
+                            val downloadingState = uiState as? DownloadUiState.Downloading
+                            ProgressCard(
+                                progress = downloadingState?.progress ?: 0,
+                                title = downloadingState?.title ?: ""
                             )
                         }
 
-                        is DownloadUiState.Downloading -> {
-                            ProgressCard(progress = state.progress, title = state.title)
+                        "Success" -> {
+                            val successState = uiState as? DownloadUiState.Success
+                            if (successState != null) {
+                                SuccessCard(
+                                    videoInfo = successState.videoInfo,
+                                    filePath = successState.filePath,
+                                    onReset = { viewModel.resetState() }
+                                )
+                            }
                         }
 
-                        is DownloadUiState.Success -> {
-                            SuccessCard(
-                                videoInfo = state.videoInfo,
-                                filePath = state.filePath,
-                                onReset = { viewModel.resetState() }
-                            )
-                        }
-
-                        is DownloadUiState.Error -> {
+                        "Error" -> {
+                            val errorMsg = (uiState as? DownloadUiState.Error)?.message ?: "Error procesando el enlace"
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = CardDefaults.cardColors(
@@ -279,11 +294,11 @@ fun HomeScreen(
                                         Text(
                                             text = "Error al procesar",
                                             fontWeight = FontWeight.Bold,
-                                            color = MaterialTheme.colorScheme.error
+                                            color = MaterialTheme.colorScheme.onErrorContainer
                                         )
                                     }
                                     Text(
-                                        text = state.message,
+                                        text = errorMsg,
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
@@ -303,14 +318,14 @@ fun HomeScreen(
                 }
             }
 
-            // Historial de descargas
+            // Historial de descargas completadas
             if (historyList.isNotEmpty()) {
                 item {
-                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Historial de Descargas",
+                        text = "Historial Reciente:",
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 8.dp)
                     )
                 }
 

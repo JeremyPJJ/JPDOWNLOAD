@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Environment
 import android.util.Log
 import com.example.videodownload.data.model.DownloadOption
+import com.example.videodownload.data.model.Platform
 import com.example.videodownload.data.model.VideoInfo
 import com.example.videodownload.data.repository.VideoExtractorRepository
 import kotlinx.coroutines.Dispatchers
@@ -36,7 +37,22 @@ class AndroidVideoDownloader(private val context: Context) {
         .retryOnConnectionFailure(true)
         .build()
 
-    suspend fun downloadMediaAsync(videoInfo: VideoInfo, selectedOption: DownloadOption? = null): Long = withContext(Dispatchers.IO) {
+    private fun getPlatformHeaders(platform: Platform): Pair<String, String> {
+        return when (platform) {
+            Platform.TWITTER -> "https://x.com/" to "https://x.com"
+            Platform.INSTAGRAM -> "https://www.instagram.com/" to "https://www.instagram.com"
+            Platform.TIKTOK -> "https://www.tiktok.com/" to "https://www.tiktok.com"
+            Platform.FACEBOOK -> "https://www.facebook.com/" to "https://www.facebook.com"
+            Platform.YOUTUBE -> "https://www.youtube.com/" to "https://www.youtube.com"
+            else -> "https://x.com/" to "https://x.com"
+        }
+    }
+
+    suspend fun downloadMediaAsync(
+        videoInfo: VideoInfo,
+        selectedOption: DownloadOption? = null,
+        onProgress: ((progress: Int, statusMsg: String) -> Unit)? = null
+    ): Long = withContext(Dispatchers.IO) {
         val option = selectedOption ?: DownloadOption(
             label = "HD MP4",
             downloadUrl = videoInfo.downloadUrl,
@@ -45,6 +61,7 @@ class AndroidVideoDownloader(private val context: Context) {
             extension = "mp4"
         )
 
+        // Si es una descarga DASH que requiere unir video + audio separados
         if (!option.isAudio && !option.audioDownloadUrl.isNullOrBlank()) {
             Log.d(TAG, "==================================================")
             Log.d(TAG, "[downloadMediaAsync] Descarga DASH Fragmentada (Chunked): Calidad=${option.quality} | Label=${option.label}")
@@ -62,12 +79,31 @@ class AndroidVideoDownloader(private val context: Context) {
             val finalFile = File(moviesDir, "${videoInfo.platform.name.lowercase()}_${cleanTitle}_${System.currentTimeMillis()}.mp4")
 
             try {
+                onProgress?.invoke(5, "Iniciando descarga de video HD...")
                 Log.d(TAG, "[downloadMediaAsync] Obteniendo stream de video por trozos...")
-                downloadFileChunked(videoInfo, option.downloadUrl, tempVideoFile, "${option.label} (Video)")
+                downloadFileChunked(
+                    videoInfo = videoInfo,
+                    rawUrl = option.downloadUrl,
+                    targetFile = tempVideoFile,
+                    label = "${option.label} (Video)",
+                    baseProgress = 5,
+                    maxProgressRange = 45,
+                    onProgress = onProgress
+                )
 
+                onProgress?.invoke(50, "Iniciando descarga de pista de audio...")
                 Log.d(TAG, "[downloadMediaAsync] Obteniendo stream de audio por trozos...")
-                downloadFileChunked(videoInfo, option.audioDownloadUrl, tempAudioFile, "${option.label} (Audio)")
+                downloadFileChunked(
+                    videoInfo = videoInfo,
+                    rawUrl = option.audioDownloadUrl,
+                    targetFile = tempAudioFile,
+                    label = "${option.label} (Audio)",
+                    baseProgress = 50,
+                    maxProgressRange = 35,
+                    onProgress = onProgress
+                )
 
+                onProgress?.invoke(88, "Unificando video y audio HD con MediaMuxer...")
                 Log.d(TAG, "[downloadMediaAsync] Invocando AudioVideoMuxer.mux()...")
                 val success = AudioVideoMuxer.mux(tempVideoFile, tempAudioFile, finalFile, option.label)
 
@@ -76,6 +112,7 @@ class AndroidVideoDownloader(private val context: Context) {
                 tempAudioFile.delete()
 
                 if (success) {
+                    onProgress?.invoke(100, "¡Guardando en Galería de Android!")
                     Log.i(TAG, "[downloadMediaAsync] DESCARGA Y MUXING EXITOSO: Archivo final ${finalFile.name} (${finalFile.length() / 1024} KB)")
 
                     // Registrar e indexar inmediatamente en la Galería de Android (MediaStore)
@@ -91,7 +128,7 @@ class AndroidVideoDownloader(private val context: Context) {
                 } else {
                     if (finalFile.exists()) finalFile.delete()
                     Log.e(TAG, "[downloadMediaAsync] ERROR CRÍTICO: Muxer falló o archivo inválido. Descarga cancelada.")
-                    throw Exception("No se pudo unir el audio con el video en esta calidad (${option.label}). Prueba la opción de descarga directa en 720p.")
+                    throw Exception("No se pudo unir el audio con el video en esta calidad (${option.label}). Prueba otra opción.")
                 }
             } catch (e: Exception) {
                 tempVideoFile.delete()
@@ -109,10 +146,15 @@ class AndroidVideoDownloader(private val context: Context) {
         videoInfo: VideoInfo,
         rawUrl: String,
         targetFile: File,
-        label: String
+        label: String,
+        baseProgress: Int,
+        maxProgressRange: Int,
+        onProgress: ((progress: Int, statusMsg: String) -> Unit)?
     ) = withContext(Dispatchers.IO) {
         var currentUrl = rawUrl
         var totalBytes = -1L
+
+        val (referer, origin) = getPlatformHeaders(videoInfo.platform)
 
         // Petición HEAD/GET inicial para obtener Content-Length
         var attempts = 0
@@ -123,8 +165,8 @@ class AndroidVideoDownloader(private val context: Context) {
                     .url(currentUrl)
                     .addHeader("User-Agent", USER_AGENT)
                     .addHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .addHeader("Referer", "https://www.youtube.com/")
-                    .addHeader("Origin", "https://www.youtube.com")
+                    .addHeader("Referer", referer)
+                    .addHeader("Origin", origin)
                     .head()
                     .build()
 
@@ -183,8 +225,8 @@ class AndroidVideoDownloader(private val context: Context) {
                         .url(currentUrl)
                         .addHeader("User-Agent", USER_AGENT)
                         .addHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
-                        .addHeader("Referer", "https://www.youtube.com/")
-                        .addHeader("Origin", "https://www.youtube.com")
+                        .addHeader("Referer", referer)
+                        .addHeader("Origin", origin)
                         .addHeader("Range", "bytes=$rangeStart-$rangeEnd")
                         .get()
                         .build()
@@ -212,8 +254,23 @@ class AndroidVideoDownloader(private val context: Context) {
                         downloadedBytes += bytesWritten
                         chunkSuccess = true
 
+                        val chunkProgress = if (totalBytes > 0) {
+                            baseProgress + ((downloadedBytes * maxProgressRange) / totalBytes).toInt()
+                        } else {
+                            baseProgress + (chunkIndex * 5)
+                        }
+
+                        val currentProgress = minOf(chunkProgress, baseProgress + maxProgressRange)
+                        val totalMbStr = if (totalBytes > 0) "${totalBytes / (1024 * 1024)} MB" else "?? MB"
+                        val currentMbStr = "${downloadedBytes / (1024 * 1024)} MB"
+
+                        onProgress?.invoke(
+                            currentProgress,
+                            "Descargando $label: $currentMbStr de $totalMbStr"
+                        )
+
                         val contentRangeHeader = response.header("Content-Range") ?: "desconocido"
-                        Log.i(TAG, "[ChunkedDownload] Trozo #$chunkIndex ÉXITO | HTTP ${response.code} | Recibidos: $bytesWritten bytes | Total acumulado: ${downloadedBytes / (1024 * 1024)} MB | Content-Range: $contentRangeHeader")
+                        Log.i(TAG, "[ChunkedDownload] Trozo #$chunkIndex ÉXITO | HTTP ${response.code} | Recibidos: $bytesWritten bytes | Progreso: $currentProgress% | Content-Range: $contentRangeHeader")
 
                         if (response.code == 200 || bytesWritten < CHUNK_SIZE) {
                             if (totalBytes <= 0) totalBytes = downloadedBytes
@@ -254,7 +311,7 @@ class AndroidVideoDownloader(private val context: Context) {
 
     private suspend fun refreshVideoUrls(originalUrl: String): VideoInfo? {
         return try {
-            val repository = VideoExtractorRepository()
+            val repository = VideoExtractorRepository(context)
             repository.extractVideoInfo(originalUrl).getOrNull()
         } catch (e: Exception) {
             Log.e(TAG, "[RefreshUrls] Error re-extrayendo URLs del video: ${e.message}")
@@ -278,7 +335,9 @@ class AndroidVideoDownloader(private val context: Context) {
         val ext = option.extension.lowercase().ifEmpty { if (option.isAudio) "m4a" else "mp4" }
         val fileName = "${videoInfo.platform.name.lowercase()}_${cleanTitle}_${System.currentTimeMillis()}.$ext"
 
-        Log.d(TAG, "[downloadMedia] Iniciando descarga directa: Platform=${videoInfo.platform} | Label=${option.label} | Ext=$ext")
+        val (referer, origin) = getPlatformHeaders(videoInfo.platform)
+
+        Log.d(TAG, "[downloadMedia] Iniciando descarga directa: Platform=${videoInfo.platform} | Label=${option.label} | Referer=$referer")
 
         val request = DownloadManager.Request(Uri.parse(option.downloadUrl))
             .setTitle(videoInfo.title)
@@ -287,8 +346,8 @@ class AndroidVideoDownloader(private val context: Context) {
             .setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE)
             .addRequestHeader("User-Agent", USER_AGENT)
             .addRequestHeader("Accept-Language", "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7")
-            .addRequestHeader("Referer", "https://www.youtube.com/")
-            .addRequestHeader("Origin", "https://www.youtube.com")
+            .addRequestHeader("Referer", referer)
+            .addRequestHeader("Origin", origin)
 
         if (option.isAudio || ext == "mp3" || ext == "m4a" || ext == "webm") {
             val mime = when (ext) {
